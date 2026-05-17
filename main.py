@@ -4,6 +4,9 @@ import subprocess
 import json
 import urllib.parse
 import os
+import shutil
+import tempfile
+
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
@@ -60,6 +63,32 @@ def get_cookies_path() -> str:
         
     return None
 
+def get_writable_cookies_path() -> str:
+    """
+    Creates a writable copy of the cookies.txt file inside a temporary directory.
+    This prevents OSError: [Errno 30] Read-only file system on platforms like Render
+    where secrets are mounted as read-only, but yt-dlp tries to overwrite them.
+    """
+    source_path = get_cookies_path()
+    if not source_path:
+        return None
+        
+    try:
+        temp_dir = tempfile.gettempdir()
+        writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
+        
+        # Copy to the writable temp directory
+        shutil.copy2(source_path, writable_path)
+        
+        # Ensure it has read/write permissions
+        os.chmod(writable_path, 0o666)
+        
+        return writable_path
+    except Exception as e:
+        print(f"Error copying cookies to writable path: {e}")
+        # Fallback to source path and hope for the best
+        return source_path
+
 def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     """
     Runs yt-dlp with custom mobile User-Agent spoofing and optional cookie auth to bypass Meta blocks.
@@ -76,10 +105,10 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         "--referer", "https://www.instagram.com/",
     ]
     
-    cookies_path = get_cookies_path()
+    cookies_path = get_writable_cookies_path()
     if cookies_path:
         cmd.extend(["--cookies", cookies_path])
-        print(f"Using cookies.txt from: {cookies_path}")
+        print(f"Using writable cookies.txt copy at: {cookies_path}")
     else:
         print("Warning: No cookies.txt found. Attempting guest session extraction.")
         
@@ -90,6 +119,7 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         raise Exception(result.stderr or "yt-dlp extraction failed")
         
     return json.loads(result.stdout)
+
 
 
 def fallback_instagram_scrape(url: str) -> dict:
