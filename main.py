@@ -35,9 +35,34 @@ def clear_cache_endpoint():
     else:
         raise HTTPException(status_code=500, detail="Failed to clear yt-dlp cache")
 
+def get_cookies_path() -> str:
+    """
+    Locates the cookies.txt file by checking:
+    1. Environment variable 'COOKIES_FILE'
+    2. Render's default secret file path '/etc/secrets/cookies.txt'
+    3. Local directory './cookies.txt'
+    Returns the path if it exists, otherwise None.
+    """
+    # 1. Environment Variable
+    env_path = os.environ.get("COOKIES_FILE")
+    if env_path and os.path.exists(env_path):
+        return env_path
+        
+    # 2. Render Secret File default mount
+    render_secret_path = "/etc/secrets/cookies.txt"
+    if os.path.exists(render_secret_path):
+        return render_secret_path
+        
+    # 3. Local Workspace
+    local_path = "cookies.txt"
+    if os.path.exists(local_path):
+        return local_path
+        
+    return None
+
 def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     """
-    Runs yt-dlp with custom mobile User-Agent spoofing to bypass Meta blocks.
+    Runs yt-dlp with custom mobile User-Agent spoofing and optional cookie auth to bypass Meta blocks.
     """
     if not user_agent:
         # High-end Android Chrome User-Agent mimicking a modern mobile device browser
@@ -49,14 +74,23 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         "--no-playlist",
         "--user-agent", user_agent,
         "--referer", "https://www.instagram.com/",
-        url
     ]
+    
+    cookies_path = get_cookies_path()
+    if cookies_path:
+        cmd.extend(["--cookies", cookies_path])
+        print(f"Using cookies.txt from: {cookies_path}")
+    else:
+        print("Warning: No cookies.txt found. Attempting guest session extraction.")
+        
+    cmd.append(url)
     
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         raise Exception(result.stderr or "yt-dlp extraction failed")
         
     return json.loads(result.stdout)
+
 
 def fallback_instagram_scrape(url: str) -> dict:
     """
