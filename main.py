@@ -92,6 +92,7 @@ def get_writable_cookies_path() -> str:
 def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     """
     Runs yt-dlp with custom mobile User-Agent spoofing and optional cookie auth to bypass Meta blocks.
+    Forces extraction of pre-merged best mobile-friendly MP4 formats to eliminate ffmpeg requirement.
     """
     if not user_agent:
         # High-end Android Chrome User-Agent mimicking a modern mobile device browser
@@ -101,6 +102,7 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         "yt-dlp",
         "--dump-json",
         "--no-playlist",
+        "-f", "best[ext=mp4]/best",
         "--user-agent", user_agent,
         "--referer", "https://www.instagram.com/",
     ]
@@ -172,8 +174,16 @@ def extract_video(url: str = Query(..., description="The video URL to extract me
             if not direct_link:
                 continue
                 
-            has_audio = f.get("acodec") != "none" and f.get("acodec") is not None
-            has_video = f.get("vcodec") != "none"
+            acodec = f.get("acodec")
+            vcodec = f.get("vcodec")
+            
+            has_audio = acodec != "none" and acodec is not None and acodec != ""
+            has_video = vcodec != "none" and vcodec is not None and vcodec != ""
+            
+            # Since the Render server lacks ffmpeg, only return pre-merged (muxed) formats
+            # having both valid audio and video tracks to prevent black-screen/audio-only downloads
+            if not (has_audio and has_video):
+                continue
             
             if direct_link:
                 resolution = f.get("resolution") or f.get("format_note") or f.get("height") or "best"
