@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 import subprocess
 import json
@@ -141,7 +141,13 @@ def fallback_instagram_scrape(url: str) -> dict:
         raise Exception(f"Fallback mobile scraper also failed: {str(e)}")
 
 @app.get("/extract")
-def extract_video(url: str = Query(..., description="The video URL to extract metadata from")):
+def extract_video(
+    url: str = Query(..., description="The video URL to extract metadata from"),
+    x_api_key: str = Header(None, description="Secure API key for client authentication")
+):
+    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+        
     if not url:
         raise HTTPException(status_code=400, detail="URL query parameter is required")
         
