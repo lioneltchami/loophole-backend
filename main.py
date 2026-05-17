@@ -19,6 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+def health_check():
+    return {"status": "alive", "message": "LoopHole Backend is running"}
+
 def clear_ytdlp_cache():
     """
     Clears the yt-dlp cache to reset cookie and throttle states.
