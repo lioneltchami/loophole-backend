@@ -119,6 +119,7 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         "--no-playlist",
         "-f", "best[ext=mp4]/best",
         "--user-agent", user_agent,
+        "--socket-timeout", "10",
     ]
     
     if "instagram.com" in url or "threads.net" in url:
@@ -155,6 +156,7 @@ def extract_media_generic(url: str, user_agent: str = None) -> dict:
     cmd = base_cmd + [
         "--dump-json",
         "--user-agent", user_agent,
+        "--socket-timeout", "10",
     ]
     
     if "instagram.com" in url or "threads.net" in url:
@@ -241,8 +243,14 @@ def extract_video(
                     info = extract_media_generic(url_decoded)
                 except Exception as generic_error:
                     print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
-                    clear_ytdlp_cache()
-                    info = fallback_instagram_scrape_generic(url_decoded)
+                    try:
+                        clear_ytdlp_cache()
+                        info = fallback_instagram_scrape_generic(url_decoded)
+                    except Exception as fallback_gen_error:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                        )
                     
         if not info:
             raise Exception("Failed to extract media info from any source")
@@ -330,6 +338,8 @@ def extract_video(
         
         return response_data
         
+    except HTTPException as he:
+        raise he
     except Exception as e:
         error_msg = str(e)
         
