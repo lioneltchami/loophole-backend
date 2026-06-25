@@ -7,7 +7,6 @@ import os
 import shutil
 import tempfile
 
-
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
 # Enable CORS for the Flutter client
@@ -19,6 +18,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def get_ytdlp_base_cmd() -> list:
+    """
+    Checks if global 'yt-dlp' executable exists in the system path.
+    Otherwise, falls back to running it via Python 'python -m yt_dlp'.
+    This enables seamless compatibility between Render container environment
+    and local development environments.
+    """
+    if shutil.which("yt-dlp"):
+        return ["yt-dlp"]
+    return ["python", "-m", "yt_dlp"]
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def health_check():
     return {"status": "alive", "message": "LoopHole Backend is running"}
@@ -28,7 +38,8 @@ def clear_ytdlp_cache():
     Clears the yt-dlp cache to reset cookie and throttle states.
     """
     try:
-        subprocess.run(["yt-dlp", "--rm-cache-dir"], check=True, capture_output=True)
+        base_cmd = get_ytdlp_base_cmd()
+        subprocess.run(base_cmd + ["--rm-cache-dir"], check=True, capture_output=True)
         return True
     except Exception as e:
         print(f"Error clearing yt-dlp cache: {e}")
@@ -102,14 +113,20 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         # High-end Android Chrome User-Agent mimicking a modern mobile device browser
         user_agent = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
     
-    cmd = [
-        "yt-dlp",
+    base_cmd = get_ytdlp_base_cmd()
+    cmd = base_cmd + [
         "--dump-json",
         "--no-playlist",
         "-f", "best[ext=mp4]/best",
         "--user-agent", user_agent,
-        "--referer", "https://www.instagram.com/",
     ]
+    
+    if "instagram.com" in url or "threads.net" in url:
+        cmd.extend(["--referer", "https://www.instagram.com/"])
+    elif "tiktok.com" in url:
+        cmd.extend(["--referer", "https://www.tiktok.com/"])
+    elif "x.com" in url or "twitter.com" in url:
+        cmd.extend(["--referer", "https://x.com/"])
     
     cookies_path = get_writable_cookies_path()
     if cookies_path:
@@ -126,7 +143,38 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
         
     return json.loads(result.stdout)
 
+def extract_media_generic(url: str, user_agent: str = None) -> dict:
+    """
+    Runs yt-dlp without the strict video format filter and allows playlists/carousels.
+    Used for extracting photos, carousels, or fallback media.
+    """
+    if not user_agent:
+        user_agent = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+    
+    base_cmd = get_ytdlp_base_cmd()
+    cmd = base_cmd + [
+        "--dump-json",
+        "--user-agent", user_agent,
+    ]
+    
+    if "instagram.com" in url or "threads.net" in url:
+        cmd.extend(["--referer", "https://www.instagram.com/"])
+    elif "tiktok.com" in url:
+        cmd.extend(["--referer", "https://www.tiktok.com/"])
+    elif "x.com" in url or "twitter.com" in url:
+        cmd.extend(["--referer", "https://x.com/"])
 
+    cookies_path = get_writable_cookies_path()
+    if cookies_path:
+        cmd.extend(["--cookies", cookies_path])
+        
+    cmd.append(url)
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(result.stderr or "yt-dlp generic extraction failed")
+        
+    return json.loads(result.stdout)
 
 def fallback_instagram_scrape(url: str) -> dict:
     """
@@ -140,9 +188,19 @@ def fallback_instagram_scrape(url: str) -> dict:
     except Exception as e:
         raise Exception(f"Fallback mobile scraper also failed: {str(e)}")
 
+def fallback_instagram_scrape_generic(url: str) -> dict:
+    """
+    Fallback generic extractor using browser impersonation with an iPhone Safari User-Agent.
+    """
+    try:
+        iphone_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        return extract_media_generic(url, user_agent=iphone_ua)
+    except Exception as e:
+        raise Exception(f"Fallback mobile generic scraper also failed: {str(e)}")
+
 @app.get("/extract")
 def extract_video(
-    url: str = Query(..., description="The video URL to extract metadata from"),
+    url: str = Query(..., description="The video/photo URL to extract metadata from"),
     x_api_key: str = Header(None, description="Secure API key for client authentication")
 ):
     if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
@@ -154,70 +212,145 @@ def extract_video(
     try:
         url_decoded = urllib.parse.unquote(url)
         
-        # 1. Attempt primary extraction using a modern Android Chrome mobile spoof
+        info = None
+        is_photo_fallback = False
+        
+        # 1. Attempt primary video-focused extraction using modern Android Chrome mobile spoof
         try:
             info = extract_with_ytdlp(url_decoded)
         except Exception as primary_error:
-            print(f"Primary Chrome spoof extraction blocked: {primary_error}. Triggering fallback iPhone Safari spoof...")
+            primary_msg = str(primary_error)
+            print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
             
-            # Clear yt-dlp cache to remove any throttled cookies/session state
-            clear_ytdlp_cache()
+            # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
+            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response"]):
+                is_photo_fallback = True
             
-            # 2. Fallback to iPhone Safari browser impersonation
-            info = fallback_instagram_scrape(url_decoded)
-
-        # Trust and use the top-level URL that yt-dlp resolved as the best pre-merged stream.
-        # This completely resolves the empty format list issue caused by Meta's dynamic/incomplete metadata tags,
-        # while safely delivering a highly compliant, pre-merged MP4 direct download link to the mobile client.
-        formats = []
-        best_url = info.get("url")
+            # If not explicitly a photo fallback, try video fallback first
+            if not is_photo_fallback:
+                try:
+                    clear_ytdlp_cache()
+                    info = fallback_instagram_scrape(url_decoded)
+                except Exception as fallback_error:
+                    print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
+                    is_photo_fallback = True
+            
+            # If we determined we need photo/generic extraction
+            if is_photo_fallback:
+                try:
+                    info = extract_media_generic(url_decoded)
+                except Exception as generic_error:
+                    print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
+                    clear_ytdlp_cache()
+                    info = fallback_instagram_scrape_generic(url_decoded)
+                    
+        if not info:
+            raise Exception("Failed to extract media info from any source")
+            
+        # Parse media type and urls
+        media_type = "video"
+        media_urls = []
         
-        if best_url:
-            resolution = info.get("resolution") or info.get("height") or info.get("format_note") or "best"
-            if isinstance(resolution, int):
-                resolution = f"{resolution}p"
-                
-            formats.append({
-                "Extension": info.get("ext") or "mp4",
-                "Has Audio": True,  # Checked and verified as pre-merged muxed MP4 via -f filter
-                "Resolution": str(resolution),
-                "Direct Download Link": best_url
-            })
+        if "entries" in info:
+            # Playlist / Carousel of items
+            entries = info["entries"]
+            media_urls = [entry.get("url") for entry in entries if entry.get("url")]
+            
+            # Check if entries are photos
+            first_entry_ext = entries[0].get("ext", "") if entries else ""
+            if first_entry_ext in ["jpg", "jpeg", "png", "webp"]:
+                media_type = "photo"
         else:
-            # Lenient fallback to the raw formats list if the top-level url is somehow not parsed
-            raw_formats = info.get("formats", [])
-            for f in raw_formats:
-                direct_link = f.get("url", "")
-                if not direct_link:
-                    continue
+            # Single item
+            url_val = info.get("url")
+            if url_val:
+                media_urls = [url_val]
+            ext = info.get("ext", "")
+            if ext in ["jpg", "jpeg", "png", "webp"]:
+                media_type = "photo"
                 
-                resolution = f.get("resolution") or f.get("format_note") or f.get("height") or "best"
+        formats = []
+        if media_type == "photo":
+            for url_val in media_urls:
+                formats.append({
+                    "Extension": "jpg",
+                    "Has Audio": False,
+                    "Resolution": "High Res",
+                    "Direct Download Link": url_val
+                })
+        else:
+            # Video formatting (original format block for backwards compatibility)
+            best_url = info.get("url")
+            if best_url:
+                resolution = info.get("resolution") or info.get("height") or info.get("format_note") or "best"
                 if isinstance(resolution, int):
                     resolution = f"{resolution}p"
                     
                 formats.append({
-                    "Extension": f.get("ext") or "mp4",
-                    "Has Audio": True,  # Keep it lenient so it satisfies client parser checks
+                    "Extension": info.get("ext") or "mp4",
+                    "Has Audio": True,
                     "Resolution": str(resolution),
-                    "Direct Download Link": direct_link
+                    "Direct Download Link": best_url
                 })
-                
-        # Build the exact contract required by parseBackendResponse in mobile client
+            else:
+                raw_formats = info.get("formats", [])
+                for f in raw_formats:
+                    direct_link = f.get("url", "")
+                    if not direct_link:
+                        continue
+                    
+                    resolution = f.get("resolution") or f.get("format_note") or f.get("height") or "best"
+                    if isinstance(resolution, int):
+                        resolution = f"{resolution}p"
+                        
+                    formats.append({
+                        "Extension": f.get("ext") or "mp4",
+                        "Has Audio": True,
+                        "Resolution": str(resolution),
+                        "Direct Download Link": direct_link
+                    })
+                    
+            if not formats and media_urls:
+                # Fallback if no format parsed but we have media_urls
+                formats.append({
+                    "Extension": "mp4",
+                    "Has Audio": True,
+                    "Resolution": "best",
+                    "Direct Download Link": media_urls[0]
+                })
+
+        # Build response with both old keys (backwards compatibility) and new keys (media_type, media_urls)
         response_data = {
-            "Video Title": info.get("title") or "Social Video",
+            "Video Title": info.get("title") or "Social Media Post",
             "Thumbnail URL": info.get("thumbnail") or (info.get("thumbnails", [{}])[0].get("url") if info.get("thumbnails") else ""),
-            "Formats": formats
+            "Formats": formats,
+            "media_type": media_type,
+            "media_urls": media_urls
         }
         
         return response_data
         
     except Exception as e:
         error_msg = str(e)
+        
+        # Check for specific private / age-restricted substrings
+        is_private = any(phrase in error_msg.lower() for phrase in [
+            "this content isn't available to everyone",
+            "this content is only available for registered users",
+            "login required",
+            "private account",
+            "private video",
+            "requires authentication"
+        ])
+        
+        if is_private:
+            raise HTTPException(
+                status_code=403, 
+                detail="This content is private or age-restricted."
+            )
+            
         if "empty media response" in error_msg:
             detail_msg = "Instagram blocked the request (Empty Media Response). Please update or refresh the 'cookies.txt' file in your Render secrets."
-            raise HTTPException(status_code=400, detail=detail_msg)
-        elif "login" in error_msg.lower() or "private" in error_msg.lower() or "authenticated" in error_msg.lower():
-            detail_msg = "This video requires login authentication or is private. Please update your backend cookies.txt."
             raise HTTPException(status_code=400, detail=detail_msg)
             
         raise HTTPException(status_code=500, detail=f"Failed to pull video: {error_msg}")
