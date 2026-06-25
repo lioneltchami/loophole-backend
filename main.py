@@ -229,10 +229,16 @@ def scrape_instagram_fallback(url: str) -> dict:
         "ext": "jpg",
     }
 
-# Create an Instaloader instance globally
+# Create an Instaloader instance globally and configure mobile browser headers
 L = instaloader.Instaloader(
-    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
 )
+L.context._session.headers.update({
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.instagram.com/",
+    "X-IG-App-ID": "936619743392459",
+})
 
 def extract_instagram_with_instaloader(url: str) -> dict:
     """
@@ -255,16 +261,29 @@ def extract_instagram_with_instaloader(url: str) -> dict:
     print(f"Instaloader: extracting shortcode '{shortcode}'")
     post = instaloader.Post.from_shortcode(L.context, shortcode)
     
+    # Dynamic title from caption
+    title = "Instagram Post"
+    if post.caption:
+        first_line = post.caption.split('\n')[0].strip()
+        if len(first_line) > 50:
+            title = first_line[:50] + "..."
+        elif first_line:
+            title = first_line
+            
     media_urls = []
     
     if post.typename == 'GraphSidecar':
         for node in post.get_sidecar_nodes():
-            if node.is_video:
-                media_urls.append(node.video_url)
-            else:
+            if not node.is_video:
                 media_urls.append(node.display_url)
-        has_video = any(node.is_video for node in post.get_sidecar_nodes())
-        media_type = "video" if has_video else "photo"
+        # If there are only videos in the carousel, fallback to node.video_url, but set media_type = "video"
+        if not media_urls:
+            for node in post.get_sidecar_nodes():
+                if node.video_url:
+                    media_urls.append(node.video_url)
+            media_type = "video"
+        else:
+            media_type = "photo"
     elif post.is_video:
         media_urls.append(post.video_url)
         media_type = "video"
@@ -275,7 +294,7 @@ def extract_instagram_with_instaloader(url: str) -> dict:
     entries = [{"url": u, "ext": "mp4" if media_type == "video" else "jpg"} for u in media_urls]
     
     return {
-        "title": post.title or "Instagram Post",
+        "title": title,
         "thumbnail": post.url,
         "url": media_urls[0] if media_urls else post.url,
         "ext": "mp4" if media_type == "video" else "jpg",
