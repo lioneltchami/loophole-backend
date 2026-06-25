@@ -212,7 +212,15 @@ def extract_video(
         return response_data
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to pull video: {str(e)}")
+        error_msg = str(e)
+        if "empty media response" in error_msg:
+            detail_msg = "Instagram blocked the request (Empty Media Response). Please update or refresh the 'cookies.txt' file in your Render secrets."
+            raise HTTPException(status_code=400, detail=detail_msg)
+        elif "login" in error_msg.lower() or "private" in error_msg.lower() or "authenticated" in error_msg.lower():
+            detail_msg = "This video requires login authentication or is private. Please update your backend cookies.txt."
+            raise HTTPException(status_code=400, detail=detail_msg)
+            
+        raise HTTPException(status_code=500, detail=f"Failed to pull video: {error_msg}")
 
 if __name__ == "__main__":
     import uvicorn
