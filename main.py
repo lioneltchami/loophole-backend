@@ -251,6 +251,23 @@ def extract_video(
             primary_msg = str(primary_error)
             print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
             
+            # Check for specific private / age-restricted substrings immediately
+            is_private = any(phrase in primary_msg.lower() for phrase in [
+                "this content isn't available to everyone",
+                "this content is only available for registered users",
+                "login required",
+                "private account",
+                "private video",
+                "requires authentication",
+                "login_via",
+                "/login/"
+            ])
+            if is_private:
+                raise HTTPException(
+                    status_code=403,
+                    detail="This content is private or age-restricted."
+                )
+            
             # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
             if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
                 is_photo_fallback = True
