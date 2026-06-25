@@ -6,6 +6,9 @@ import urllib.parse
 import os
 import shutil
 import tempfile
+import yt_dlp
+import requests
+from bs4 import BeautifulSoup
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
@@ -108,75 +111,71 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     """
     Runs yt-dlp with custom mobile User-Agent spoofing and optional cookie auth to bypass Meta blocks.
     Forces extraction of pre-merged best mobile-friendly MP4 formats to eliminate ffmpeg requirement.
+    Uses programmatic yt-dlp to enforce strict 10s socket timeout.
     """
     if not user_agent:
-        # High-end Android Chrome User-Agent mimicking a modern mobile device browser
         user_agent = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
     
-    base_cmd = get_ytdlp_base_cmd()
-    cmd = base_cmd + [
-        "--dump-json",
-        "--no-playlist",
-        "-f", "best[ext=mp4]/best",
-        "--user-agent", user_agent,
-        "--socket-timeout", "10",
-    ]
+    ydl_opts = {
+        'socket_timeout': 10,
+        'format': 'best[ext=mp4]/best',
+        'noplaylist': True,
+        'user_agent': user_agent,
+        'quiet': True,
+        'no_warnings': True,
+    }
     
+    headers = {}
     if "instagram.com" in url or "threads.net" in url:
-        cmd.extend(["--referer", "https://www.instagram.com/"])
+        headers['Referer'] = 'https://www.instagram.com/'
     elif "tiktok.com" in url:
-        cmd.extend(["--referer", "https://www.tiktok.com/"])
+        headers['Referer'] = 'https://www.tiktok.com/'
     elif "x.com" in url or "twitter.com" in url:
-        cmd.extend(["--referer", "https://x.com/"])
-    
+        headers['Referer'] = 'https://x.com/'
+        
+    if headers:
+        ydl_opts['http_headers'] = headers
+        
     cookies_path = get_writable_cookies_path()
     if cookies_path:
-        cmd.extend(["--cookies", cookies_path])
-        print(f"Using writable cookies.txt copy at: {cookies_path}")
-    else:
-        print("Warning: No cookies.txt found. Attempting guest session extraction.")
+        ydl_opts['cookiefile'] = cookies_path
         
-    cmd.append(url)
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(result.stderr or "yt-dlp extraction failed")
-        
-    return json.loads(result.stdout)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
 
 def extract_media_generic(url: str, user_agent: str = None) -> dict:
     """
     Runs yt-dlp without the strict video format filter and allows playlists/carousels.
     Used for extracting photos, carousels, or fallback media.
+    Uses programmatic yt-dlp to enforce strict 10s socket timeout.
     """
     if not user_agent:
         user_agent = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+        
+    ydl_opts = {
+        'socket_timeout': 10,
+        'user_agent': user_agent,
+        'quiet': True,
+        'no_warnings': True,
+    }
     
-    base_cmd = get_ytdlp_base_cmd()
-    cmd = base_cmd + [
-        "--dump-json",
-        "--user-agent", user_agent,
-        "--socket-timeout", "10",
-    ]
-    
+    headers = {}
     if "instagram.com" in url or "threads.net" in url:
-        cmd.extend(["--referer", "https://www.instagram.com/"])
+        headers['Referer'] = 'https://www.instagram.com/'
     elif "tiktok.com" in url:
-        cmd.extend(["--referer", "https://www.tiktok.com/"])
+        headers['Referer'] = 'https://www.tiktok.com/'
     elif "x.com" in url or "twitter.com" in url:
-        cmd.extend(["--referer", "https://x.com/"])
-
+        headers['Referer'] = 'https://x.com/'
+        
+    if headers:
+        ydl_opts['http_headers'] = headers
+        
     cookies_path = get_writable_cookies_path()
     if cookies_path:
-        cmd.extend(["--cookies", cookies_path])
+        ydl_opts['cookiefile'] = cookies_path
         
-    cmd.append(url)
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise Exception(result.stderr or "yt-dlp generic extraction failed")
-        
-    return json.loads(result.stdout)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
 
 def fallback_instagram_scrape(url: str) -> dict:
     """
@@ -199,6 +198,34 @@ def fallback_instagram_scrape_generic(url: str) -> dict:
         return extract_media_generic(url, user_agent=iphone_ua)
     except Exception as e:
         raise Exception(f"Fallback mobile generic scraper also failed: {str(e)}")
+
+def scrape_instagram_fallback(url: str) -> dict:
+    """
+    Lightweight fallback HTML scraper for Instagram.
+    Fetches the raw page and extracts the og:image meta tag.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    }
+    response = requests.get(url, headers=headers, timeout=10)
+    if response.status_code != 200:
+        raise Exception(f"Failed to fetch Instagram page: HTTP {response.status_code}")
+        
+    soup = BeautifulSoup(response.text, 'html.parser')
+    meta_tag = soup.find('meta', property='og:image')
+    if not meta_tag or not meta_tag.get('content'):
+        raise Exception("Could not find og:image meta tag on Instagram page")
+        
+    img_url = meta_tag['content']
+    
+    return {
+        "title": "Instagram Photo",
+        "thumbnail": img_url,
+        "url": img_url,
+        "ext": "jpg",
+    }
 
 @app.get("/extract")
 def extract_video(
@@ -247,10 +274,21 @@ def extract_video(
                         clear_ytdlp_cache()
                         info = fallback_instagram_scrape_generic(url_decoded)
                     except Exception as fallback_gen_error:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
-                        )
+                        if "instagram.com" in url_decoded:
+                            try:
+                                print("yt-dlp photo fallback failed completely. Trying custom HTML scraper fallback...")
+                                info = scrape_instagram_fallback(url_decoded)
+                            except Exception as scraper_error:
+                                print(f"Custom Instagram scraper fallback failed: {scraper_error}")
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
+                                )
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                            )
                     
         if not info:
             raise Exception("Failed to extract media info from any source")
