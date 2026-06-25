@@ -223,7 +223,7 @@ def extract_video(
             print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
             
             # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
-            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response"]):
+            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
                 is_photo_fallback = True
             
             # If not explicitly a photo fallback, try video fallback first
@@ -340,7 +340,9 @@ def extract_video(
             "login required",
             "private account",
             "private video",
-            "requires authentication"
+            "requires authentication",
+            "login_via",
+            "/login/"
         ])
         
         if is_private:
