@@ -9,6 +9,8 @@ import tempfile
 import yt_dlp
 import requests
 from bs4 import BeautifulSoup
+import instaloader
+import re
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
@@ -227,6 +229,59 @@ def scrape_instagram_fallback(url: str) -> dict:
         "ext": "jpg",
     }
 
+# Create an Instaloader instance globally
+L = instaloader.Instaloader(
+    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+def extract_instagram_with_instaloader(url: str) -> dict:
+    """
+    Instagram scraper using Instaloader.
+    Supports single photos, videos, and carousels (sidecars).
+    """
+    pattern = r"instagram\.com/(?:p|reel|tv|share/p)/([A-Za-z0-9_-]+)"
+    match = re.search(pattern, url)
+    if not match:
+        parts = [p for p in url.split("/") if p]
+        if len(parts) >= 2:
+            shortcode = parts[-1]
+            if len(shortcode) > 15:
+                shortcode = shortcode.split("?")[0]
+        else:
+            raise Exception("Invalid Instagram URL structure")
+    else:
+        shortcode = match.group(1)
+        
+    print(f"Instaloader: extracting shortcode '{shortcode}'")
+    post = instaloader.Post.from_shortcode(L.context, shortcode)
+    
+    media_urls = []
+    
+    if post.typename == 'GraphSidecar':
+        for node in post.get_sidecar_nodes():
+            if node.is_video:
+                media_urls.append(node.video_url)
+            else:
+                media_urls.append(node.display_url)
+        has_video = any(node.is_video for node in post.get_sidecar_nodes())
+        media_type = "video" if has_video else "photo"
+    elif post.is_video:
+        media_urls.append(post.video_url)
+        media_type = "video"
+    else:
+        media_urls.append(post.url)
+        media_type = "photo"
+        
+    entries = [{"url": u, "ext": "mp4" if media_type == "video" else "jpg"} for u in media_urls]
+    
+    return {
+        "title": post.title or "Instagram Post",
+        "thumbnail": post.url,
+        "url": media_urls[0] if media_urls else post.url,
+        "ext": "mp4" if media_type == "video" else "jpg",
+        "entries": entries
+    }
+
 @app.get("/extract")
 def extract_video(
     url: str = Query(..., description="The video/photo URL to extract metadata from"),
@@ -244,68 +299,77 @@ def extract_video(
         info = None
         is_photo_fallback = False
         
-        # 1. Attempt primary video-focused extraction using modern Android Chrome mobile spoof
-        try:
-            info = extract_with_ytdlp(url_decoded)
-        except Exception as primary_error:
-            primary_msg = str(primary_error)
-            print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
-            
-            # Check for specific private / age-restricted substrings immediately
-            is_private = any(phrase in primary_msg.lower() for phrase in [
-                "this content isn't available to everyone",
-                "this content is only available for registered users",
-                "login required",
-                "private account",
-                "private video",
-                "requires authentication",
-                "login_via",
-                "/login/"
-            ])
-            if is_private:
-                raise HTTPException(
-                    status_code=403,
-                    detail="This content is private or age-restricted."
-                )
-            
-            # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
-            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
-                is_photo_fallback = True
-            
-            # If not explicitly a photo fallback, try video fallback first
-            if not is_photo_fallback:
-                try:
-                    clear_ytdlp_cache()
-                    info = fallback_instagram_scrape(url_decoded)
-                except Exception as fallback_error:
-                    print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
+        # If Instagram URL, try Instaloader first
+        if "instagram.com" in url_decoded:
+            try:
+                info = extract_instagram_with_instaloader(url_decoded)
+                print("Instagram extraction with Instaloader succeeded!")
+            except Exception as instaloader_error:
+                print(f"Instagram Instaloader extraction failed: {instaloader_error}. Falling back to yt-dlp...")
+
+        if info is None:
+            # 1. Attempt primary video-focused extraction using modern Android Chrome mobile spoof
+            try:
+                info = extract_with_ytdlp(url_decoded)
+            except Exception as primary_error:
+                primary_msg = str(primary_error)
+                print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
+                
+                # Check for specific private / age-restricted substrings immediately
+                is_private = any(phrase in primary_msg.lower() for phrase in [
+                    "this content isn't available to everyone",
+                    "this content is only available for registered users",
+                    "login required",
+                    "private account",
+                    "private video",
+                    "requires authentication",
+                    "login_via",
+                    "/login/"
+                ])
+                if is_private:
+                    raise HTTPException(
+                        status_code=403,
+                        detail="This content is private or age-restricted."
+                    )
+                
+                # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
+                if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
                     is_photo_fallback = True
-            
-            # If we determined we need photo/generic extraction
-            if is_photo_fallback:
-                try:
-                    info = extract_media_generic(url_decoded)
-                except Exception as generic_error:
-                    print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
+                
+                # If not explicitly a photo fallback, try video fallback first
+                if not is_photo_fallback:
                     try:
                         clear_ytdlp_cache()
-                        info = fallback_instagram_scrape_generic(url_decoded)
-                    except Exception as fallback_gen_error:
-                        if "instagram.com" in url_decoded:
-                            try:
-                                print("yt-dlp photo fallback failed completely. Trying custom HTML scraper fallback...")
-                                info = scrape_instagram_fallback(url_decoded)
-                            except Exception as scraper_error:
-                                print(f"Custom Instagram scraper fallback failed: {scraper_error}")
+                        info = fallback_instagram_scrape(url_decoded)
+                    except Exception as fallback_error:
+                        print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
+                        is_photo_fallback = True
+                
+                # If we determined we need photo/generic extraction
+                if is_photo_fallback:
+                    try:
+                        info = extract_media_generic(url_decoded)
+                    except Exception as generic_error:
+                        print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
+                        try:
+                            clear_ytdlp_cache()
+                            info = fallback_instagram_scrape_generic(url_decoded)
+                        except Exception as fallback_gen_error:
+                            if "instagram.com" in url_decoded:
+                                try:
+                                    print("yt-dlp photo fallback failed completely. Trying custom HTML scraper fallback...")
+                                    info = scrape_instagram_fallback(url_decoded)
+                                except Exception as scraper_error:
+                                    print(f"Custom Instagram scraper fallback failed: {scraper_error}")
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
+                                    )
+                            else:
                                 raise HTTPException(
                                     status_code=400,
-                                    detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
+                                    detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
                                 )
-                        else:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
-                            )
                     
         if not info:
             raise Exception("Failed to extract media info from any source")
