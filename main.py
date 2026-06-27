@@ -86,9 +86,33 @@ def get_cookies_path() -> str:
 def get_writable_cookies_path() -> str:
     """
     Creates a writable copy of the cookies.txt file inside a temporary directory.
-    This prevents OSError: [Errno 30] Read-only file system on platforms like Render
-    where secrets are mounted as read-only, but yt-dlp tries to overwrite them.
+    This prevents OSError: [Errno 30] Read-only file system on platforms like Render.
+    Also handles the 'IG_COOKIES' environment variable and formats it as a valid
+    Netscape HTTP Cookie File if present.
     """
+    # 1. Check if 'IG_COOKIES' environment variable is provided
+    ig_cookies = os.environ.get("IG_COOKIES")
+    if ig_cookies:
+        try:
+            temp_dir = tempfile.gettempdir()
+            writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
+            
+            # Format and prepare cookie file content
+            cookie_content = ig_cookies.strip()
+            
+            # Ensure the cookie content starts with the Netscape header line
+            if not cookie_content.startswith("# Netscape HTTP Cookie File"):
+                cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+                
+            with open(writable_path, "w", encoding="utf-8") as f:
+                f.write(cookie_content)
+                
+            os.chmod(writable_path, 0o666)
+            return writable_path
+        except Exception as e:
+            print(f"Error writing IG_COOKIES to writable temp path: {e}")
+
+    # 2. Fallback to reading cookies.txt from file paths
     source_path = get_cookies_path()
     if not source_path:
         return None
