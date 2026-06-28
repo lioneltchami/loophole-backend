@@ -489,6 +489,13 @@ def extract_video(
             detail_msg = "Instagram blocked the request (Empty Media Response). Please update or refresh the 'cookies.txt' file in your Render secrets."
             raise HTTPException(status_code=400, detail=detail_msg)
             
+        # Catch Instagram photo/carousel downloads for older clients
+        if "instagram.com" in url.lower() and "no video formats found" in error_msg.lower():
+            raise HTTPException(
+                status_code=400,
+                detail="This Instagram post contains photos/images, not a video. 📸 Currently, only videos are supported for download!"
+            )
+            
         raise HTTPException(status_code=500, detail=f"Failed to pull video: {error_msg}")
 
 if __name__ == "__main__":
