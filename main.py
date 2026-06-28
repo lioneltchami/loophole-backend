@@ -267,6 +267,34 @@ def extract_video(
         
     try:
         url_decoded = urllib.parse.unquote(url)
+        url_lower = url_decoded.lower()
+
+        # Friendly check for Pinterest login/error redirects
+        if "pinterest.com" in url_lower and "show_error=true" in url_lower:
+            raise HTTPException(
+                status_code=400,
+                detail="Oops! This looks like a Pinterest login/error link. 📌 Please copy the link using the 'Share' button in the Pinterest app instead!"
+            )
+
+        # Check if user copied the generic homepage by mistake
+        base_urls = [
+            "https://pinterest.com", "https://www.pinterest.com",
+            "https://instagram.com", "https://www.instagram.com",
+            "https://facebook.com", "https://www.facebook.com",
+            "https://tiktok.com", "https://www.tiktok.com",
+            "https://youtube.com", "https://www.youtube.com",
+            "http://pinterest.com", "http://www.pinterest.com",
+            "http://instagram.com", "http://www.instagram.com",
+            "http://facebook.com", "http://www.facebook.com",
+            "http://tiktok.com", "http://www.tiktok.com",
+            "http://youtube.com", "http://www.youtube.com"
+        ]
+        clean_url = url_lower.strip().rstrip('/')
+        if clean_url in base_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="Please copy a link to a specific video or post, not the homepage!"
+            )
         
         info = None
         is_photo_fallback = False
