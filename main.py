@@ -9,7 +9,6 @@ import tempfile
 import yt_dlp
 import requests
 from bs4 import BeautifulSoup
-import instaloader
 import re
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
@@ -253,78 +252,7 @@ def scrape_instagram_fallback(url: str) -> dict:
         "ext": "jpg",
     }
 
-# Create an Instaloader instance globally and configure mobile browser headers
-L = instaloader.Instaloader(
-    user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-)
-L.context._session.headers.update({
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.instagram.com/",
-    "X-IG-App-ID": "936619743392459",
-})
 
-def extract_instagram_with_instaloader(url: str) -> dict:
-    """
-    Instagram scraper using Instaloader.
-    Supports single photos, videos, and carousels (sidecars).
-    """
-    pattern = r"instagram\.com/(?:p|reel|tv|share/p)/([A-Za-z0-9_-]+)"
-    match = re.search(pattern, url)
-    if not match:
-        parts = [p for p in url.split("/") if p]
-        if len(parts) >= 2:
-            shortcode = parts[-1]
-            if len(shortcode) > 15:
-                shortcode = shortcode.split("?")[0]
-        else:
-            raise Exception("Invalid Instagram URL structure")
-    else:
-        shortcode = match.group(1)
-        
-    print(f"Instaloader: extracting shortcode '{shortcode}'")
-    post = instaloader.Post.from_shortcode(L.context, shortcode)
-    
-    # Dynamic title from caption
-    title = "Instagram Post"
-    if post.caption:
-        first_line = post.caption.split('\n')[0].strip()
-        if len(first_line) > 50:
-            title = first_line[:50] + "..."
-        elif first_line:
-            title = first_line
-            
-    media_urls = []
-    
-    if post.typename == 'GraphSidecar':
-        for node in post.get_sidecar_nodes():
-            if not node.is_video:
-                media_urls.append(node.display_url)
-        # If there are only videos in the carousel, fallback to node.video_url, but set media_type = "video"
-        if not media_urls:
-            for node in post.get_sidecar_nodes():
-                if node.video_url:
-                    media_urls.append(node.video_url)
-            media_type = "video"
-        else:
-            media_type = "photo"
-    elif post.is_video:
-        media_urls.append(post.video_url)
-        media_type = "video"
-    else:
-        media_urls.append(post.url)
-        media_type = "photo"
-        
-    entries = [{"url": u, "ext": "mp4" if media_type == "video" else "jpg"} for u in media_urls]
-    
-    return {
-        "title": title,
-        "thumbnail": post.url,
-        "url": media_urls[0] if media_urls else post.url,
-        "ext": "mp4" if media_type == "video" else "jpg",
-        "entries": entries
-    }
 
 @app.get("/extract")
 def extract_video(
@@ -342,14 +270,6 @@ def extract_video(
         
         info = None
         is_photo_fallback = False
-        
-        # If Instagram URL, try Instaloader first
-        if "instagram.com" in url_decoded:
-            try:
-                info = extract_instagram_with_instaloader(url_decoded)
-                print("Instagram extraction with Instaloader succeeded!")
-            except Exception as instaloader_error:
-                print(f"Instagram Instaloader extraction failed: {instaloader_error}. Falling back to yt-dlp...")
 
         if info is None:
             # 1. Attempt primary video-focused extraction using modern Android Chrome mobile spoof

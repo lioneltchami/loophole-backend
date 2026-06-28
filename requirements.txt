@@ -4,4 +4,3 @@ yt-dlp
 curl_cffi
 requests
 beautifulsoup4
-instaloader
