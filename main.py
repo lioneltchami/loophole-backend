@@ -358,6 +358,11 @@ def extract_video(
                                         detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
                                     )
                             else:
+                                if "pinterest.com" in url_decoded.lower() and "no video formats found" in str(fallback_gen_error).lower():
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail="This Pinterest link is an image, not a video. 📌 Currently, only Pinterest Videos are supported for download!"
+                                    )
                                 raise HTTPException(
                                     status_code=400,
                                     detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
