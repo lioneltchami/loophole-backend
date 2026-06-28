@@ -358,10 +358,18 @@ def extract_video(
                                         detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
                                     )
                             else:
-                                if "pinterest.com" in url_decoded.lower() and "no video formats found" in str(fallback_gen_error).lower():
+                                error_str = str(fallback_gen_error).lower()
+                                is_pinterest = "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower()
+                                
+                                if is_pinterest and "no video formats found" in error_str:
                                     raise HTTPException(
                                         status_code=400,
                                         detail="This Pinterest link is an image, not a video. 📌 Currently, only Pinterest Videos are supported for download!"
+                                    )
+                                elif is_pinterest and ("pinterestcollection" in error_str or "404" in error_str):
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
                                     )
                                 raise HTTPException(
                                     status_code=400,
