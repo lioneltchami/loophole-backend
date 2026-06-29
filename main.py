@@ -170,8 +170,16 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     if cookies_path:
         ydl_opts['cookiefile'] = cookies_path
         
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        if "proxy" in ydl_opts and ("502" in str(e) or "proxy" in str(e).lower()):
+            ydl_opts.pop("proxy", None)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        else:
+            raise e
 
 def extract_media_generic(url: str, user_agent: str = None) -> dict:
     """
@@ -208,8 +216,16 @@ def extract_media_generic(url: str, user_agent: str = None) -> dict:
     if cookies_path:
         ydl_opts['cookiefile'] = cookies_path
         
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        if "proxy" in ydl_opts and ("502" in str(e) or "proxy" in str(e).lower()):
+            ydl_opts.pop("proxy", None)
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        else:
+            raise e
 
 def send_telegram_alert(message: str):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
