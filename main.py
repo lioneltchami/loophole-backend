@@ -211,6 +211,22 @@ def extract_media_generic(url: str, user_agent: str = None) -> dict:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
+def send_telegram_alert(message: str):
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "HTML"
+    }
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Failed to send Telegram alert: {e}")
+
 def fallback_instagram_scrape(url: str) -> dict:
     """
     Fallback extractor using browser impersonation with an iPhone Safari User-Agent
@@ -494,7 +510,17 @@ def extract_video(
                 detail="This content is private or age-restricted."
             )
             
+        server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+            
         if "empty media response" in error_msg:
+            alert_msg = (
+                f"🚨 <b>LoopHole Alert</b>\n\n"
+                f"<b>Server:</b> <code>{server_name}</code>\n"
+                f"<b>Error:</b> Instagram Cookies Blocked / Expired 🍪\n"
+                f"<b>Action Required:</b> Please generate fresh cookies and update cookies.txt."
+            )
+            send_telegram_alert(alert_msg)
+            
             detail_msg = "Instagram blocked the request (Empty Media Response). Please update or refresh the 'cookies.txt' file in your Render secrets."
             raise HTTPException(status_code=400, detail=detail_msg)
             
@@ -504,6 +530,27 @@ def extract_video(
                 status_code=400,
                 detail="This Instagram post contains photos/images, not a video. 📸 Currently, only videos are supported for download!"
             )
+            
+        # Proxy connection failures
+        if any(phrase in error_msg.lower() for phrase in ["proxyerror", "tunnel connection failed", "unable to connect to proxy", "proxy error"]):
+            alert_msg = (
+                f"⚠️ <b>LoopHole Alert</b>\n\n"
+                f"<b>Server:</b> <code>{server_name}</code>\n"
+                f"<b>Error:</b> Proxy Connection Failed\n"
+                f"<b>Details:</b> <code>{error_msg}</code>\n"
+                f"<b>Action Required:</b> Check Smartproxy dashboard bandwidth or trial limits."
+            )
+            send_telegram_alert(alert_msg)
+        else:
+            # Other general 500 server crashes
+            alert_msg = (
+                f"🔥 <b>LoopHole Alert</b>\n\n"
+                f"<b>Server:</b> <code>{server_name}</code>\n"
+                f"<b>Error:</b> General Extraction Failure\n"
+                f"<b>Target URL:</b> {url}\n"
+                f"<b>Details:</b> <code>{error_msg[:300]}...</code>"
+            )
+            send_telegram_alert(alert_msg)
             
         raise HTTPException(status_code=500, detail=f"Failed to pull video: {error_msg}")
     finally:
