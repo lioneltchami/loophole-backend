@@ -139,7 +139,7 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     Uses programmatic yt-dlp to enforce strict 10s socket timeout.
     """
     if not user_agent:
-        user_agent = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+        user_agent = os.environ.get("IG_USER_AGENT") or "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
     
     ydl_opts = {
         'socket_timeout': 10,
@@ -175,7 +175,7 @@ def extract_media_generic(url: str, user_agent: str = None) -> dict:
     Uses programmatic yt-dlp to enforce strict 10s socket timeout.
     """
     if not user_agent:
-        user_agent = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+        user_agent = os.environ.get("IG_USER_AGENT") or "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
         
     ydl_opts = {
         'socket_timeout': 10,
@@ -208,9 +208,9 @@ def fallback_instagram_scrape(url: str) -> dict:
     if standard Chrome-spoofed extraction is throttled or blocked.
     """
     try:
-        # Alternate high-quality iPhone Safari mobile UA
-        iphone_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-        return extract_with_ytdlp(url, user_agent=iphone_ua)
+        # Alternate high-quality iPhone Safari mobile UA, fall back to IG_USER_AGENT if cookies are active
+        ua = os.environ.get("IG_USER_AGENT") or "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        return extract_with_ytdlp(url, user_agent=ua)
     except Exception as e:
         raise Exception(f"Fallback mobile scraper also failed: {str(e)}")
 
@@ -219,8 +219,8 @@ def fallback_instagram_scrape_generic(url: str) -> dict:
     Fallback generic extractor using browser impersonation with an iPhone Safari User-Agent.
     """
     try:
-        iphone_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-        return extract_media_generic(url, user_agent=iphone_ua)
+        ua = os.environ.get("IG_USER_AGENT") or "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+        return extract_media_generic(url, user_agent=ua)
     except Exception as e:
         raise Exception(f"Fallback mobile generic scraper also failed: {str(e)}")
 
