@@ -11,6 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import gc
+import random
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
@@ -60,26 +61,35 @@ def clear_cache_endpoint():
 
 def get_cookies_path() -> str:
     """
-    Locates the cookies.txt file by checking:
+    Locates available cookies.txt files and randomly returns one to rotate accounts.
+    Checks:
     1. Environment variable 'COOKIES_FILE'
-    2. Render's default secret file path '/etc/secrets/cookies.txt'
-    3. Local directory './cookies.txt'
-    Returns the path if it exists, otherwise None.
+    2. Render's default secret file paths '/etc/secrets/cookies.txt', 'cookies2.txt', 'cookies3.txt', etc.
+    3. Local directory './cookies.txt', 'cookies2.txt', etc.
     """
-    # 1. Environment Variable
+    paths = []
+    
+    # 1. Check environment variable path
     env_path = os.environ.get("COOKIES_FILE")
     if env_path and os.path.exists(env_path):
-        return env_path
+        paths.append(env_path)
         
-    # 2. Render Secret File default mount
-    render_secret_path = "/etc/secrets/cookies.txt"
-    if os.path.exists(render_secret_path):
-        return render_secret_path
-        
-    # 3. Local Workspace
-    local_path = "cookies.txt"
-    if os.path.exists(local_path):
-        return local_path
+    # 2. Check multiple filenames in secrets and local folder
+    filenames = ["cookies.txt", "cookies2.txt", "cookies3.txt", "cookies4.txt", "cookies5.txt"]
+    directories = ["/etc/secrets", "."]
+    
+    for directory in directories:
+        for filename in filenames:
+            full_path = os.path.join(directory, filename)
+            if os.path.exists(full_path):
+                paths.append(full_path)
+                
+    # Deduplicate and return one randomly chosen path
+    unique_paths = list(set(paths))
+    if unique_paths:
+        chosen = random.choice(unique_paths)
+        print(f"Rotating Cookies: Selected session from {chosen}")
+        return chosen
         
     return None
 
