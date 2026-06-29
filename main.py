@@ -10,6 +10,7 @@ import yt_dlp
 import requests
 from bs4 import BeautifulSoup
 import re
+import gc
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
@@ -505,6 +506,8 @@ def extract_video(
             )
             
         raise HTTPException(status_code=500, detail=f"Failed to pull video: {error_msg}")
+    finally:
+        gc.collect()
 
 if __name__ == "__main__":
     import uvicorn
