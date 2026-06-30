@@ -162,7 +162,7 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     }
     
     proxy_url = os.environ.get("PROXY_URL")
-    if proxy_url and ("instagram.com" in url or "threads.net" in url):
+    if proxy_url and "instagram.com" in url:
         ydl_opts['proxy'] = proxy_url
     
     headers = {}
@@ -208,7 +208,7 @@ def extract_media_generic(url: str, user_agent: str = None) -> dict:
     }
     
     proxy_url = os.environ.get("PROXY_URL")
-    if proxy_url and ("instagram.com" in url or "threads.net" in url):
+    if proxy_url and "instagram.com" in url:
         ydl_opts['proxy'] = proxy_url
     
     headers = {}
