@@ -507,75 +507,74 @@ def extract_video(
             primary_msg = str(primary_error)
             print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
                 
-                # Check for specific private / age-restricted substrings immediately
-                is_private = any(phrase in primary_msg.lower() for phrase in [
-                    "this content isn't available to everyone",
-                    "this content is only available for registered users",
-                    "login required",
-                    "private account",
-                    "private video",
-                    "requires authentication",
-                    "login_via",
-                    "/login/"
-                ])
-                if is_private:
-                    raise HTTPException(
-                        status_code=403,
-                        detail="This content is private or age-restricted."
-                    )
-                
-                # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
-                if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
+            # Check for specific private / age-restricted substrings immediately
+            is_private = any(phrase in primary_msg.lower() for phrase in [
+                "this content isn't available to everyone",
+                "this content is only available for registered users",
+                "login required",
+                "private account",
+                "private video",
+                "requires authentication",
+                "login_via",
+                "/login/"
+            ])
+            if is_private:
+                raise HTTPException(
+                    status_code=403,
+                    detail="This content is private or age-restricted."
+                )
+            
+            # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
+            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
+                is_photo_fallback = True
+            
+            # If not explicitly a photo fallback, try video fallback first
+            if not is_photo_fallback:
+                try:
+                    clear_ytdlp_cache()
+                    info = fallback_instagram_scrape(url_decoded, use_cookies=True)
+                except Exception as fallback_error:
+                    print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
                     is_photo_fallback = True
-                
-                # If not explicitly a photo fallback, try video fallback first
-                if not is_photo_fallback:
+            
+            # If we determined we need photo/generic extraction
+            if is_photo_fallback:
+                try:
+                    info = extract_media_generic(url_decoded, use_cookies=True)
+                except Exception as generic_error:
+                    print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
                     try:
                         clear_ytdlp_cache()
-                        info = fallback_instagram_scrape(url_decoded, use_cookies=True)
-                    except Exception as fallback_error:
-                        print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
-                        is_photo_fallback = True
-                
-                # If we determined we need photo/generic extraction
-                if is_photo_fallback:
-                    try:
-                        info = extract_media_generic(url_decoded, use_cookies=True)
-                    except Exception as generic_error:
-                        print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
-                        try:
-                            clear_ytdlp_cache()
-                            info = fallback_instagram_scrape_generic(url_decoded, use_cookies=True)
-                        except Exception as fallback_gen_error:
-                            if "instagram.com" in url_decoded:
-                                try:
-                                    print("yt-dlp photo fallback failed completely. Trying custom HTML scraper fallback...")
-                                    info = scrape_instagram_fallback(url_decoded)
-                                except Exception as scraper_error:
-                                    print(f"Custom Instagram scraper fallback failed: {scraper_error}")
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
-                                    )
-                            else:
-                                error_str = str(fallback_gen_error).lower()
-                                is_pinterest = "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower()
-                                
-                                if is_pinterest and "no video formats found" in error_str:
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="This Pinterest link is an image, not a video. 📌 Currently, only Pinterest Videos are supported for download!"
-                                    )
-                                elif is_pinterest and ("pinterestcollection" in error_str or "404" in error_str):
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
-                                    )
+                        info = fallback_instagram_scrape_generic(url_decoded, use_cookies=True)
+                    except Exception as fallback_gen_error:
+                        if "instagram.com" in url_decoded:
+                            try:
+                                print("yt-dlp photo fallback failed completely. Trying custom HTML scraper fallback...")
+                                info = scrape_instagram_fallback(url_decoded)
+                            except Exception as scraper_error:
+                                print(f"Custom Instagram scraper fallback failed: {scraper_error}")
                                 raise HTTPException(
                                     status_code=400,
-                                    detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                                    detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
                                 )
-                    
+                        else:
+                            error_str = str(fallback_gen_error).lower()
+                            is_pinterest = "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower()
+                            
+                            if is_pinterest and "no video formats found" in error_str:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail="This Pinterest link is an image, not a video. 📌 Currently, only Pinterest Videos are supported for download!"
+                                )
+                            elif is_pinterest and ("pinterestcollection" in error_str or "404" in error_str):
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
+                                )
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                            )
         if not info:
             raise Exception("Failed to extract media info from any source")
             
