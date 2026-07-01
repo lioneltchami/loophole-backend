@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 import re
 import gc
 import random
+import asyncio
 
 app = FastAPI(title="VidgetGo Backend", version="1.0.0")
 
@@ -58,6 +59,57 @@ def clear_cache_endpoint():
         return {"status": "success", "message": "Backend cache cleared successfully"}
     else:
         raise HTTPException(status_code=500, detail="Failed to clear yt-dlp cache")
+
+async def auto_update_ytdlp():
+    """
+    Background loop that runs every 12 hours.
+    It forces an upgrade of yt-dlp via pip and sends a Telegram alert if an update occurred.
+    """
+    while True:
+        try:
+            print("Running yt-dlp auto-updater check...")
+            current_version = yt_dlp.version.__version__
+            
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["pip", "install", "-U", "yt-dlp"],
+                capture_output=True, text=True
+            )
+            
+            if "Successfully installed yt-dlp-" in result.stdout:
+                server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+                alert_msg = (
+                    f"🔔 <b>LoopHole Auto-Updater</b>\n\n"
+                    f"<b>Server:</b> <code>{server_name}</code>\n"
+                    f"<code>yt-dlp</code> was successfully updated on the server to the latest version!\n"
+                    f"<b>Previous Version:</b> {current_version}"
+                )
+                send_telegram_alert(alert_msg)
+            else:
+                print("yt-dlp is already up to date.")
+        except Exception as e:
+            print(f"Auto-updater failed: {e}")
+            
+        # Sleep for 12 hours (43200 seconds)
+        await asyncio.sleep(43200)
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(auto_update_ytdlp())
+
+@app.get("/test-telegram")
+def test_telegram_endpoint():
+    """
+    Manual endpoint to test Telegram notifications.
+    """
+    server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+    alert_msg = (
+        f"✅ <b>LoopHole Test Notification</b>\n\n"
+        f"<b>Server:</b> <code>{server_name}</code>\n"
+        f"Your Telegram integration is working perfectly!"
+    )
+    send_telegram_alert(alert_msg)
+    return {"status": "success", "message": "Test notification sent to Telegram!"}
 
 def get_cookies_path() -> str:
     """
