@@ -166,11 +166,22 @@ def diagnose_cookies_endpoint():
     
     for cookie_file in found_files:
         filename = os.path.basename(cookie_file)
+        temp_cookie_path = None
+        
+        try:
+            temp_dir = tempfile.gettempdir()
+            temp_cookie_path = os.path.join(temp_dir, f"diag_test_{filename}")
+            shutil.copy2(cookie_file, temp_cookie_path)
+            os.chmod(temp_cookie_path, 0o666)
+        except Exception as copy_err:
+            results[filename] = f"FAILED: Copy to temp failed: {copy_err}"
+            continue
+
         ydl_opts = {
             'socket_timeout': 10,
             'quiet': True,
             'no_warnings': True,
-            'cookiefile': cookie_file,
+            'cookiefile': temp_cookie_path,
             'user_agent': "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
         }
         
@@ -187,6 +198,12 @@ def diagnose_cookies_endpoint():
                 results[filename] = "BLOCKED at network layer (unexpected EOF/SSL drop)"
             else:
                 results[filename] = f"FAILED: {str(e)[:50]}"
+        finally:
+            if temp_cookie_path and os.path.exists(temp_cookie_path):
+                try:
+                    os.remove(temp_cookie_path)
+                except Exception as remove_err:
+                    print(f"Error removing diagnostic temp cookie: {remove_err}")
                 
     return {
         "status": "completed",
