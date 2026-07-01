@@ -111,23 +111,113 @@ def test_telegram_endpoint():
     send_telegram_alert(alert_msg)
     return {"status": "success", "message": "Test notification sent to Telegram!"}
 
-def get_cookies_path() -> str:
+@app.get("/diagnose-telegram")
+def diagnose_telegram_endpoint():
     """
-    Locates available cookies.txt files and randomly returns one to rotate accounts.
-    Checks:
-    1. Environment variable 'COOKIES_FILE'
-    2. Render's default secret file paths '/etc/secrets/cookies.txt', 'cookies2.txt', 'cookies3.txt', etc.
-    3. Local directory './cookies.txt', 'cookies2.txt', etc.
+    Exposes Telegram bot diagnostics as an HTTP endpoint.
     """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    
+    report = []
+    report.append(f"Telegram Token: {token[:6]}...{token[-6:] if token else 'None'}")
+    report.append(f"Telegram Chat ID: {chat_id}")
+    
+    if not token or not chat_id:
+        return {"status": "failed", "error": "Missing environment variables", "details": report}
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": "🔌 <b>LoopHole Diagnostic Test via HTTP</b>\nIf you see this, your Telegram Bot credentials are 100% correct!",
+        "parse_mode": "HTML"
+    }
+    
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        report.append(f"HTTP Status Code: {response.status_code}")
+        response_data = response.json()
+        
+        if response_data.get("ok"):
+            return {"status": "success", "message": "Message sent successfully!", "diagnostic_logs": report, "telegram_response": response_data}
+        else:
+            description = response_data.get("description", "")
+            return {"status": "failed", "error": description, "diagnostic_logs": report, "telegram_response": response_data}
+    except Exception as e:
+        return {"status": "error", "error": str(e), "diagnostic_logs": report}
+
+@app.get("/diagnose-cookies")
+def diagnose_cookies_endpoint():
+    """
+    Scans and checks the validity of all cookies.txt files.
+    """
+    import glob
+    cookie_patterns = ["*cookies*.txt", "cookies*.txt"]
+    directories = ["/etc/secrets", "."]
+    
+    found_files = []
+    for directory in directories:
+        for pattern in cookie_patterns:
+            found_files.extend(glob.glob(os.path.join(directory, pattern)))
+            
+    found_files = list(set(found_files))
+    test_ig_url = "https://www.instagram.com/p/C-c5nKxS_Pq/"
+    results = {}
+    
+    for cookie_file in found_files:
+        filename = os.path.basename(cookie_file)
+        ydl_opts = {
+            'socket_timeout': 10,
+            'quiet': True,
+            'no_warnings': True,
+            'cookiefile': cookie_file,
+            'user_agent': "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(test_ig_url, download=False)
+                title = info.get('title', 'Unknown')
+                results[filename] = f"WORKING! Title: {title[:20]}"
+        except Exception as e:
+            err = str(e).lower()
+            if "login_via" in err or "login required" in err or "private" in err:
+                results[filename] = "EXPIRED/INVALID (Instagram rejected login)"
+            elif "unexpected_eof" in err or "ssl" in err:
+                results[filename] = "BLOCKED at network layer (unexpected EOF/SSL drop)"
+            else:
+                results[filename] = f"FAILED: {str(e)[:50]}"
+                
+    return {
+        "status": "completed",
+        "cookies_detected": len(found_files),
+        "results": results
+    }
+
+def get_cookies_path(url: str = "") -> str:
+    """
+    Locates available cookies.txt files based on the requested platform.
+    """
+    url_lower = url.lower()
+    
+    # 1. Determine which cookie filenames to look for based on platform
+    if "facebook.com" in url_lower or "fb.watch" in url_lower or "fb.gg" in url_lower:
+        filenames = ["facebook_cookies.txt"]
+    elif "pinterest.com" in url_lower or "pin.it" in url_lower:
+        filenames = ["pinterest_cookies.txt"]
+    elif "instagram.com" in url_lower:
+        filenames = ["instagram_cookies.txt", "cookies.txt", "cookies2.txt", "cookies3.txt", "cookies4.txt", "cookies5.txt"]
+    else:
+        return None # No cookies for YouTube, TikTok, etc.
+
     paths = []
     
-    # 1. Check environment variable path
+    # 2. Check environment variable path (legacy override)
     env_path = os.environ.get("COOKIES_FILE")
     if env_path and os.path.exists(env_path):
         paths.append(env_path)
         
-    # 2. Check multiple filenames in secrets and local folder
-    filenames = ["cookies.txt", "cookies2.txt", "cookies3.txt", "cookies4.txt", "cookies5.txt"]
+    # 3. Check filenames in secrets and local folder
     directories = ["/etc/secrets", "."]
     
     for directory in directories:
@@ -140,62 +230,57 @@ def get_cookies_path() -> str:
     unique_paths = list(set(paths))
     if unique_paths:
         chosen = random.choice(unique_paths)
-        print(f"Rotating Cookies: Selected session from {chosen}")
+        print(f"Rotating Cookies: Selected session from {chosen} for URL {url}")
         return chosen
         
     return None
 
-def get_writable_cookies_path() -> str:
+def get_writable_cookies_path(url: str = "") -> str:
     """
     Creates a writable copy of the cookies.txt file inside a temporary directory.
-    This prevents OSError: [Errno 30] Read-only file system on platforms like Render.
-    Also handles the 'IG_COOKIES' environment variable and formats it as a valid
-    Netscape HTTP Cookie File if present.
     """
-    # 1. Check if 'IG_COOKIES' environment variable is provided
-    ig_cookies = os.environ.get("IG_COOKIES")
-    if ig_cookies:
-        try:
-            temp_dir = tempfile.gettempdir()
-            writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
-            
-            # Format and prepare cookie file content
-            cookie_content = ig_cookies.strip()
-            
-            # Ensure the cookie content starts with the Netscape header line
-            if not cookie_content.startswith("# Netscape HTTP Cookie File"):
-                cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+    url_lower = url.lower()
+    
+    # 1. Check if 'IG_COOKIES' environment variable is provided, ONLY for Instagram
+    if "instagram.com" in url_lower:
+        ig_cookies = os.environ.get("IG_COOKIES")
+        if ig_cookies:
+            try:
+                temp_dir = tempfile.gettempdir()
+                writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
                 
-            with open(writable_path, "w", encoding="utf-8") as f:
-                f.write(cookie_content)
-                
-            os.chmod(writable_path, 0o666)
-            return writable_path
-        except Exception as e:
-            print(f"Error writing IG_COOKIES to writable temp path: {e}")
+                cookie_content = ig_cookies.strip()
+                if not cookie_content.startswith("# Netscape HTTP Cookie File"):
+                    cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+                    
+                with open(writable_path, "w", encoding="utf-8") as f:
+                    f.write(cookie_content)
+                    
+                os.chmod(writable_path, 0o666)
+                return writable_path
+            except Exception as e:
+                print(f"Error writing IG_COOKIES to writable temp path: {e}")
 
-    # 2. Fallback to reading cookies.txt from file paths
-    source_path = get_cookies_path()
+    # 2. Fallback to reading cookies from file paths
+    source_path = get_cookies_path(url)
     if not source_path:
         return None
         
     try:
         temp_dir = tempfile.gettempdir()
-        writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
+        filename_base = os.path.basename(source_path)
+        writable_path = os.path.join(temp_dir, f"writable_{filename_base}")
         
         # Copy to the writable temp directory
         shutil.copy2(source_path, writable_path)
-        
-        # Ensure it has read/write permissions
         os.chmod(writable_path, 0o666)
         
         return writable_path
     except Exception as e:
         print(f"Error copying cookies to writable path: {e}")
-        # Fallback to source path and hope for the best
         return source_path
 
-def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
+def extract_with_ytdlp(url: str, user_agent: str = None, use_cookies: bool = True) -> dict:
     """
     Runs yt-dlp with custom mobile User-Agent spoofing and optional cookie auth to bypass Meta blocks.
     Forces extraction of pre-merged best mobile-friendly MP4 formats to eliminate ffmpeg requirement.
@@ -228,22 +313,24 @@ def extract_with_ytdlp(url: str, user_agent: str = None) -> dict:
     if headers:
         ydl_opts['http_headers'] = headers
         
-    cookies_path = get_writable_cookies_path()
-    if cookies_path:
-        ydl_opts['cookiefile'] = cookies_path
+    if use_cookies:
+        cookies_path = get_writable_cookies_path(url)
+        if cookies_path:
+            ydl_opts['cookiefile'] = cookies_path
         
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception as e:
-        if "proxy" in ydl_opts and ("502" in str(e) or "proxy" in str(e).lower()):
+        error_msg = str(e).lower()
+        if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
             ydl_opts.pop("proxy", None)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
         else:
             raise e
 
-def extract_media_generic(url: str, user_agent: str = None) -> dict:
+def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = True) -> dict:
     """
     Runs yt-dlp without the strict video format filter and allows playlists/carousels.
     Used for extracting photos, carousels, or fallback media.
@@ -274,15 +361,17 @@ def extract_media_generic(url: str, user_agent: str = None) -> dict:
     if headers:
         ydl_opts['http_headers'] = headers
         
-    cookies_path = get_writable_cookies_path()
-    if cookies_path:
-        ydl_opts['cookiefile'] = cookies_path
+    if use_cookies:
+        cookies_path = get_writable_cookies_path(url)
+        if cookies_path:
+            ydl_opts['cookiefile'] = cookies_path
         
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             return ydl.extract_info(url, download=False)
     except Exception as e:
-        if "proxy" in ydl_opts and ("502" in str(e) or "proxy" in str(e).lower()):
+        error_msg = str(e).lower()
+        if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
             ydl_opts.pop("proxy", None)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -305,7 +394,7 @@ def send_telegram_alert(message: str):
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
 
-def fallback_instagram_scrape(url: str) -> dict:
+def fallback_instagram_scrape(url: str, use_cookies: bool = True) -> dict:
     """
     Fallback extractor using browser impersonation with an iPhone Safari User-Agent
     if standard Chrome-spoofed extraction is throttled or blocked.
@@ -313,17 +402,17 @@ def fallback_instagram_scrape(url: str) -> dict:
     try:
         # Alternate high-quality iPhone Safari mobile UA, fall back to IG_USER_AGENT if cookies are active
         ua = os.environ.get("IG_USER_AGENT") or "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-        return extract_with_ytdlp(url, user_agent=ua)
+        return extract_with_ytdlp(url, user_agent=ua, use_cookies=use_cookies)
     except Exception as e:
         raise Exception(f"Fallback mobile scraper also failed: {str(e)}")
 
-def fallback_instagram_scrape_generic(url: str) -> dict:
+def fallback_instagram_scrape_generic(url: str, use_cookies: bool = True) -> dict:
     """
     Fallback generic extractor using browser impersonation with an iPhone Safari User-Agent.
     """
     try:
         ua = os.environ.get("IG_USER_AGENT") or "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-        return extract_media_generic(url, user_agent=ua)
+        return extract_media_generic(url, user_agent=ua, use_cookies=use_cookies)
     except Exception as e:
         raise Exception(f"Fallback mobile generic scraper also failed: {str(e)}")
 
@@ -402,13 +491,21 @@ def extract_video(
         info = None
         is_photo_fallback = False
 
-        if info is None:
-            # 1. Attempt primary video-focused extraction using modern Android Chrome mobile spoof
-            try:
-                info = extract_with_ytdlp(url_decoded)
-            except Exception as primary_error:
-                primary_msg = str(primary_error)
-                print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
+        is_hybrid_platform = any(domain in url_lower for domain in ["facebook.com", "fb.watch", "fb.gg", "pinterest.com", "pin.it"])
+
+        # 1. Primary extraction with or without cookies
+        try:
+            if is_hybrid_platform:
+                try:
+                    info = extract_with_ytdlp(url_decoded, use_cookies=False)
+                except Exception as e:
+                    print(f"Extraction without cookies failed for {url_decoded}: {e}. Retrying with cookies...")
+                    info = extract_with_ytdlp(url_decoded, use_cookies=True)
+            else:
+                info = extract_with_ytdlp(url_decoded, use_cookies=True)
+        except Exception as primary_error:
+            primary_msg = str(primary_error)
+            print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
                 
                 # Check for specific private / age-restricted substrings immediately
                 is_private = any(phrase in primary_msg.lower() for phrase in [
@@ -435,7 +532,7 @@ def extract_video(
                 if not is_photo_fallback:
                     try:
                         clear_ytdlp_cache()
-                        info = fallback_instagram_scrape(url_decoded)
+                        info = fallback_instagram_scrape(url_decoded, use_cookies=True)
                     except Exception as fallback_error:
                         print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
                         is_photo_fallback = True
@@ -443,12 +540,12 @@ def extract_video(
                 # If we determined we need photo/generic extraction
                 if is_photo_fallback:
                     try:
-                        info = extract_media_generic(url_decoded)
+                        info = extract_media_generic(url_decoded, use_cookies=True)
                     except Exception as generic_error:
                         print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
                         try:
                             clear_ytdlp_cache()
-                            info = fallback_instagram_scrape_generic(url_decoded)
+                            info = fallback_instagram_scrape_generic(url_decoded, use_cookies=True)
                         except Exception as fallback_gen_error:
                             if "instagram.com" in url_decoded:
                                 try:
