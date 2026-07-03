@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Query, HTTPException, Header
+from fastapi import FastAPI, Query, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 import subprocess
 import json
 import urllib.parse
@@ -14,7 +15,12 @@ import gc
 import random
 import asyncio
 
-app = FastAPI(title="VidgetGo Backend", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(auto_update_ytdlp())
+    yield
+
+app = FastAPI(title="VidgetGo Backend", version="1.0.0", lifespan=lifespan)
 
 # Enable CORS for the Flutter client
 app.add_middleware(
@@ -53,7 +59,11 @@ def clear_ytdlp_cache():
         return False
 
 @app.post("/clear-cache")
-def clear_cache_endpoint():
+def clear_cache_endpoint(request: Request):
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+        
     success = clear_ytdlp_cache()
     if success:
         return {"status": "success", "message": "Backend cache cleared successfully"}
@@ -93,64 +103,17 @@ async def auto_update_ytdlp():
         # Sleep for 12 hours (43200 seconds)
         await asyncio.sleep(43200)
 
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(auto_update_ytdlp())
 
-@app.get("/test-telegram")
-def test_telegram_endpoint():
-    """
-    Manual endpoint to test Telegram notifications.
-    """
-    server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
-    alert_msg = (
-        f"✅ <b>LoopHole Test Notification</b>\n\n"
-        f"<b>Server:</b> <code>{server_name}</code>\n"
-        f"Your Telegram integration is working perfectly!"
-    )
-    send_telegram_alert(alert_msg)
-    return {"status": "success", "message": "Test notification sent to Telegram!"}
-
-@app.get("/diagnose-telegram")
-def diagnose_telegram_endpoint():
-    """
-    Exposes Telegram bot diagnostics as an HTTP endpoint.
-    """
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    
-    report = []
-    report.append(f"Telegram Token: {token[:6]}...{token[-6:] if token else 'None'}")
-    report.append(f"Telegram Chat ID: {chat_id}")
-    
-    if not token or not chat_id:
-        return {"status": "failed", "error": "Missing environment variables", "details": report}
-
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": "🔌 <b>LoopHole Diagnostic Test via HTTP</b>\nIf you see this, your Telegram Bot credentials are 100% correct!",
-        "parse_mode": "HTML"
-    }
-    
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        report.append(f"HTTP Status Code: {response.status_code}")
-        response_data = response.json()
-        
-        if response_data.get("ok"):
-            return {"status": "success", "message": "Message sent successfully!", "diagnostic_logs": report, "telegram_response": response_data}
-        else:
-            description = response_data.get("description", "")
-            return {"status": "failed", "error": description, "diagnostic_logs": report, "telegram_response": response_data}
-    except Exception as e:
-        return {"status": "error", "error": str(e), "diagnostic_logs": report}
 
 @app.get("/diagnose-cookies")
-def diagnose_cookies_endpoint():
+def diagnose_cookies_endpoint(request: Request):
     """
     Scans and checks the validity of all cookies.txt files.
     """
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+
     import glob
     cookie_patterns = ["*cookies*.txt", "cookies*.txt"]
     directories = ["/etc/secrets", "."]
@@ -578,16 +541,17 @@ def extract_video(
                             error_str = str(fallback_gen_error).lower()
                             is_pinterest = "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower()
                             
-                            if is_pinterest and "no video formats found" in error_str:
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail="This Pinterest link is an image, not a video. 📌 Currently, only Pinterest Videos are supported for download!"
-                                )
-                            elif is_pinterest and ("pinterestcollection" in error_str or "404" in error_str):
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
-                                )
+                            if is_pinterest:
+                                if "pinterestcollection" in error_str or "404" in error_str:
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
+                                    )
+                                else:
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail="This Pinterest link appears to be an image. 📌 You can download photos directly in Pinterest by tapping the three dots and choosing 'Download image'."
+                                    )
                             raise HTTPException(
                                 status_code=400,
                                 detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
