@@ -1,6 +1,6 @@
 fastapi>=0.100.0
 uvicorn>=0.22.0
-yt-dlp==2026.06.09
+yt-dlp==2026.07.04
 curl_cffi
 requests
 beautifulsoup4
