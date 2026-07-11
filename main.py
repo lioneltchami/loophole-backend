@@ -587,13 +587,11 @@ def extract_instagram_media(url: str) -> dict:
             
         post_media = [u for u in all_cdn if ('t51.82787-15' in u or 't51.71878-15' in u) and quality_score(u) >= 1]
         
-        seen_bases = set()
+        # We only take the FIRST valid image found (which is the main post's image).
+        # Otherwise, the regex picks up the 'See more' preview posts at the bottom of the page.
         for u in post_media:
-            base = re.search(r'/(\d+_[^/?]+\.(?:jpg|jpeg|png|heic|mp4))', u)
-            key = base.group(1) if base else u.split('?')[0]
-            if key not in seen_bases:
-                seen_bases.add(key)
-                media_urls.append(u)
+            media_urls.append(u)
+            break
                 
         video_urls = re.findall(r'src="(https://[^"]+\.mp4[^"]*)"', text)
         video_urls = [html_lib.unescape(v) for v in video_urls]
