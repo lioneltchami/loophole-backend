@@ -483,7 +483,7 @@ def extract_instagram_media(url: str) -> dict:
             headers=headers,
             proxies=proxies,
             impersonate="chrome131",
-            timeout=15,
+            timeout=30, # Increased to 30s to accommodate mobile proxy latency
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Instagram is temporarily unavailable. Please try again later. (Error: {str(e)})")
