@@ -426,79 +426,150 @@ def scrape_instagram_fallback(url: str) -> dict:
 
 
 
-def extract_instagram_photo(url: str) -> dict:
+def _parse_ig_cookies_to_dict(cookie_env_var: str) -> dict:
     """
-    Extracts photos and carousels from Instagram using Instaloader.
-    Specifically uses independent cookies to avoid interfering with yt-dlp.
+    Parse Netscape-format cookie string into a dict for curl_cffi session.
     """
-    import instaloader
-    from http.cookiejar import MozillaCookieJar
+    cookies = {}
+    for line in cookie_env_var.splitlines():
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = line.split('\t')
+        if len(parts) >= 7:
+            name = parts[5]
+            value = parts[6]
+            cookies[name] = value
+    return cookies
+
+
+def extract_instagram_media(url: str) -> dict:
+    """
+    Extracts Instagram photos, carousels, and videos using curl_cffi
+    to impersonate Chrome's TLS fingerprint.
     
-    # 1. Initialize Instaloader
-    L = instaloader.Instaloader(quiet=True)
+    This bypasses Instagram's bot detection on datacenter IPs, which
+    blocks standard requests/instaloader/gallery-dl via graphql/query.
     
-    # 2. Set proxy if available
-    proxy_url = os.environ.get("PROXY_URL")
-    if proxy_url:
-        L.context._session.proxies = {"http": proxy_url, "https": proxy_url}
-        
-    # 3. Load Independent Cookies
-    # We use IG_COOKIES_PHOTO_1 or IG_COOKIES_PHOTO_2
-    ig_cookies_photo = os.environ.get("IG_COOKIES_PHOTO_1") or os.environ.get("IG_COOKIES_PHOTO_2")
-    if ig_cookies_photo:
-        try:
-            temp_dir = tempfile.gettempdir()
-            writable_path = os.path.join(temp_dir, "instaloader_cookies.txt")
-            
-            cookie_content = ig_cookies_photo.strip()
-            if not cookie_content.startswith("# Netscape HTTP Cookie File"):
-                cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
-                
-            with open(writable_path, "w", encoding="utf-8") as f:
-                f.write(cookie_content)
-                
-            cj = MozillaCookieJar(writable_path)
-            cj.load()
-            L.context._session.cookies.update(cj)
-            
-            if os.path.exists(writable_path):
-                os.remove(writable_path)
-        except Exception as e:
-            print(f"Error loading Instaloader cookies: {e}")
-            
-    # 4. Extract shortcode
-    match = re.search(r'instagram\.com/p/([^/?#&]+)', url)
+    Approach:
+    1. Convert post URL to shortcode
+    2. Hit Instagram's internal /api/v1/media/shortcode/{shortcode}/info/
+       with Chrome TLS fingerprint + x-ig-app-id header + cookies
+    3. Parse the JSON response to extract all image/video CDN URLs
+    """
+    from curl_cffi import requests as cffi_requests
+    import re
+    
+    # 1. Extract shortcode from URL
+    match = re.search(r'/p/([A-Za-z0-9_-]+)', url)
     if not match:
-        raise HTTPException(status_code=400, detail="Invalid Instagram photo URL format.")
+        raise HTTPException(status_code=400, detail="Invalid Instagram post URL.")
     shortcode = match.group(1)
     
+    # 2. Build headers that mimic Instagram web app
+    ig_app_id = os.environ.get("IG_APP_ID", "936619743392459")
+    headers = {
+        "x-ig-app-id": ig_app_id,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+        "Origin": "https://www.instagram.com",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+    }
+    
+    # 3. Load cookies from environment variables
+    cookies = {}
+    ig_cookies_photo = os.environ.get("IG_COOKIES_PHOTO_1") or os.environ.get("IG_COOKIES_PHOTO_2") or os.environ.get("IG_COOKIES")
+    if ig_cookies_photo:
+        cookies = _parse_ig_cookies_to_dict(ig_cookies_photo)
+    
+    # 4. Set up proxy
+    proxy_url = os.environ.get("PROXY_URL")
+    proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
+    
+    # 5. Hit Instagram's internal media info endpoint with Chrome TLS fingerprint
+    api_url = f"https://i.instagram.com/api/v1/media/shortcode/{shortcode}/info/"
+    
     try:
-        post = instaloader.Post.from_shortcode(L.context, shortcode)
-    except instaloader.exceptions.LoginRequiredException:
-        raise HTTPException(status_code=403, detail="This content is private or age-restricted (or cookies expired).")
-    except instaloader.exceptions.BadResponseException:
-        raise HTTPException(status_code=403, detail="Instagram blocked the request. Please update photo cookies.")
+        resp = cffi_requests.get(
+            api_url,
+            headers=headers,
+            cookies=cookies,
+            proxies=proxies,
+            impersonate="chrome131",
+            timeout=15,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Instaloader failed: {str(e)}")
-        
-    # 5. Extract URLs
+        raise HTTPException(status_code=500, detail=f"Network request failed: {str(e)}")
+    
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail="Post not found or deleted.")
+    if resp.status_code == 401 or resp.status_code == 403:
+        raise HTTPException(status_code=403, detail="Instagram is blocking this request. Please update your cookies (IG_COOKIES_PHOTO_1).")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"Instagram returned HTTP {resp.status_code}.")
+    
+    # 6. Parse the JSON response
+    try:
+        data = resp.json()
+    except Exception:
+        raise HTTPException(status_code=500, detail="Instagram returned an invalid response.")
+    
+    items = data.get("items") or []
+    if not items:
+        raise HTTPException(status_code=400, detail="No media found in this post.")
+    
+    item = items[0]
     media_urls = []
-    if post.typename == 'GraphSidecar':
-        for node in post.get_sidecar_nodes():
-            if not node.is_video:
-                media_urls.append(node.display_url)
-    else:
-        if not post.is_video:
-            media_urls.append(post.url)
-            
+    owner = item.get("user", {}).get("username", "unknown")
+    thumbnail = ""
+    
+    media_type = item.get("media_type")  # 1=photo, 2=video, 8=carousel
+    
+    def best_image_url(candidates: list) -> str:
+        """Pick the highest-resolution image from candidates list."""
+        if not candidates:
+            return ""
+        best = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+        return best.get("url", "")
+    
+    if media_type == 8:  # Carousel
+        for node in item.get("carousel_media") or []:
+            node_type = node.get("media_type")
+            if node_type == 2:  # video
+                video_versions = node.get("video_versions") or []
+                if video_versions:
+                    media_urls.append(video_versions[0]["url"])
+            else:  # photo
+                candidates = node.get("image_versions2", {}).get("candidates") or []
+                img_url = best_image_url(candidates)
+                if img_url:
+                    media_urls.append(img_url)
+    elif media_type == 2:  # Single video
+        video_versions = item.get("video_versions") or []
+        if video_versions:
+            media_urls.append(video_versions[0]["url"])
+    else:  # Single photo
+        candidates = item.get("image_versions2", {}).get("candidates") or []
+        img_url = best_image_url(candidates)
+        if img_url:
+            media_urls.append(img_url)
+    
+    # Thumbnail
+    candidates = item.get("image_versions2", {}).get("candidates") or []
+    thumbnail = best_image_url(candidates) if candidates else (media_urls[0] if media_urls else "")
+    
     if not media_urls:
-        raise HTTPException(status_code=400, detail="No photos found in this post (it might be a video only).")
-        
+        raise HTTPException(status_code=400, detail="No downloadable media found in this post.")
+    
     return {
-        "media_type": "photo",
+        "media_type": "carousel",
         "media_urls": media_urls,
-        "Video Title": f"Post by @{post.owner_username}",
-        "Thumbnail URL": media_urls[0] if media_urls else ""
+        "Video Title": f"Post by @{owner}",
+        "Thumbnail URL": thumbnail,
     }
 
 
@@ -544,9 +615,13 @@ def extract_video(
                 detail="Please copy a link to a specific video or post, not the homepage!"
             )
             
-        # --- INSTALOADER PHOTO PATH ---
+        # --- INSTAGRAM /p/ : curl_cffi Chrome-impersonation extractor ---
         if "/p/" in url_lower and "instagram.com" in url_lower:
-            return extract_instagram_photo(url_decoded)
+            return extract_instagram_media(url_decoded)
+        
+        # --- PINTEREST: try yt-dlp, fallback later ---
+        if "pinterest.com" in url_lower or "pin.it" in url_lower:
+            pass  # Falls through to yt-dlp below
         
         info = None
         is_photo_fallback = False

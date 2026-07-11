@@ -3,5 +3,4 @@ uvicorn>=0.22.0
 yt-dlp==2026.07.04
 curl_cffi
 requests
-beautifulsoup4
-instaloader
+beautifulsoup4==4.12.3
