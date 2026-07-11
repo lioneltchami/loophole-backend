@@ -426,6 +426,82 @@ def scrape_instagram_fallback(url: str) -> dict:
 
 
 
+def extract_instagram_photo(url: str) -> dict:
+    """
+    Extracts photos and carousels from Instagram using Instaloader.
+    Specifically uses independent cookies to avoid interfering with yt-dlp.
+    """
+    import instaloader
+    from http.cookiejar import MozillaCookieJar
+    
+    # 1. Initialize Instaloader
+    L = instaloader.Instaloader(quiet=True)
+    
+    # 2. Set proxy if available
+    proxy_url = os.environ.get("PROXY_URL")
+    if proxy_url:
+        L.context._session.proxies = {"http": proxy_url, "https": proxy_url}
+        
+    # 3. Load Independent Cookies
+    # We use IG_COOKIES_PHOTO_1 or IG_COOKIES_PHOTO_2
+    ig_cookies_photo = os.environ.get("IG_COOKIES_PHOTO_1") or os.environ.get("IG_COOKIES_PHOTO_2")
+    if ig_cookies_photo:
+        try:
+            temp_dir = tempfile.gettempdir()
+            writable_path = os.path.join(temp_dir, "instaloader_cookies.txt")
+            
+            cookie_content = ig_cookies_photo.strip()
+            if not cookie_content.startswith("# Netscape HTTP Cookie File"):
+                cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+                
+            with open(writable_path, "w", encoding="utf-8") as f:
+                f.write(cookie_content)
+                
+            cj = MozillaCookieJar(writable_path)
+            cj.load()
+            L.context._session.cookies.update(cj)
+            
+            if os.path.exists(writable_path):
+                os.remove(writable_path)
+        except Exception as e:
+            print(f"Error loading Instaloader cookies: {e}")
+            
+    # 4. Extract shortcode
+    match = re.search(r'instagram\.com/p/([^/?#&]+)', url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid Instagram photo URL format.")
+    shortcode = match.group(1)
+    
+    try:
+        post = instaloader.Post.from_shortcode(L.context, shortcode)
+    except instaloader.exceptions.LoginRequiredException:
+        raise HTTPException(status_code=403, detail="This content is private or age-restricted (or cookies expired).")
+    except instaloader.exceptions.BadResponseException:
+        raise HTTPException(status_code=403, detail="Instagram blocked the request. Please update photo cookies.")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Instaloader failed: {str(e)}")
+        
+    # 5. Extract URLs
+    media_urls = []
+    if post.typename == 'GraphSidecar':
+        for node in post.get_sidecar_nodes():
+            if not node.is_video:
+                media_urls.append(node.display_url)
+    else:
+        if not post.is_video:
+            media_urls.append(post.url)
+            
+    if not media_urls:
+        raise HTTPException(status_code=400, detail="No photos found in this post (it might be a video only).")
+        
+    return {
+        "media_type": "photo",
+        "media_urls": media_urls,
+        "Video Title": f"Post by @{post.owner_username}",
+        "Thumbnail URL": media_urls[0] if media_urls else ""
+    }
+
+
 @app.get("/extract")
 def extract_video(
     url: str = Query(..., description="The video/photo URL to extract metadata from"),
@@ -467,6 +543,10 @@ def extract_video(
                 status_code=400,
                 detail="Please copy a link to a specific video or post, not the homepage!"
             )
+            
+        # --- INSTALOADER PHOTO PATH ---
+        if "/p/" in url_lower and "instagram.com" in url_lower:
+            return extract_instagram_photo(url_decoded)
         
         info = None
         is_photo_fallback = False

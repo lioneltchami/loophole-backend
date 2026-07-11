@@ -4,3 +4,4 @@ yt-dlp==2026.07.04
 curl_cffi
 requests
 beautifulsoup4
+instaloader
