@@ -719,6 +719,20 @@ def extract_video(
             
             # If we determined we need photo/generic extraction
             if is_photo_fallback:
+                if "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower():
+                    # Fail fast for Pinterest instead of wasting 30 seconds on generic extractors
+                    error_str = primary_msg.lower()
+                    if "pinterestcollection" in error_str or "404" in error_str:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="This Pinterest link appears to be an image. 📌 You can download photos directly in Pinterest by tapping the three dots and choosing 'Download image'."
+                        )
+                        
                 try:
                     info = extract_media_generic(url_decoded, use_cookies=True)
                 except Exception as generic_error:
@@ -738,20 +752,6 @@ def extract_video(
                                     detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
                                 )
                         else:
-                            error_str = str(fallback_gen_error).lower()
-                            is_pinterest = "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower()
-                            
-                            if is_pinterest:
-                                if "pinterestcollection" in error_str or "404" in error_str:
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
-                                    )
-                                else:
-                                    raise HTTPException(
-                                        status_code=400,
-                                        detail="This Pinterest link appears to be an image. 📌 You can download photos directly in Pinterest by tapping the three dots and choosing 'Download image'."
-                                    )
                             raise HTTPException(
                                 status_code=400,
                                 detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
