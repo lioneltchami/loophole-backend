@@ -445,59 +445,42 @@ def _parse_ig_cookies_to_dict(cookie_env_var: str) -> dict:
 
 def extract_instagram_media(url: str) -> dict:
     """
-    Extracts Instagram photos, carousels, and videos using curl_cffi
-    to impersonate Chrome's TLS fingerprint.
+    Extracts Instagram photos, carousels, and videos using the PUBLIC
+    embed page (/p/{shortcode}/embed/captioned/).
     
-    This bypasses Instagram's bot detection on datacenter IPs, which
-    blocks standard requests/instaloader/gallery-dl via graphql/query.
-    
-    Approach:
-    1. Convert post URL to shortcode
-    2. Hit Instagram's internal /api/v1/media/shortcode/{shortcode}/info/
-       with Chrome TLS fingerprint + x-ig-app-id header + cookies
-    3. Parse the JSON response to extract all image/video CDN URLs
+    This approach:
+    - Works WITHOUT login or cookies (public posts only)
+    - Uses curl_cffi Chrome TLS fingerprint to avoid bot detection
+    - Parses CDN image/video URLs directly from the embed page HTML
+    - Handles single photos, carousels, and videos
     """
     from curl_cffi import requests as cffi_requests
-    import re
+    import re, html as html_lib
     
-    # 1. Extract shortcode from URL
+    # 1. Extract shortcode
     match = re.search(r'/p/([A-Za-z0-9_-]+)', url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid Instagram post URL.")
     shortcode = match.group(1)
     
-    # 2. Build headers that mimic Instagram web app
-    ig_app_id = os.environ.get("IG_APP_ID", "936619743392459")
+    # 2. Fetch the public embed page
+    embed_url = f"https://www.instagram.com/p/{shortcode}/embed/captioned/"
     headers = {
-        "x-ig-app-id": ig_app_id,
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        "Accept": "*/*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.instagram.com/",
-        "Origin": "https://www.instagram.com",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
     }
     
-    # 3. Load cookies from environment variables
-    cookies = {}
-    ig_cookies_photo = os.environ.get("IG_COOKIES_PHOTO_1") or os.environ.get("IG_COOKIES_PHOTO_2") or os.environ.get("IG_COOKIES")
-    if ig_cookies_photo:
-        cookies = _parse_ig_cookies_to_dict(ig_cookies_photo)
-    
-    # 4. Set up proxy
     proxy_url = os.environ.get("PROXY_URL")
     proxies = {"https": proxy_url, "http": proxy_url} if proxy_url else None
     
-    # 5. Hit Instagram's internal media info endpoint with Chrome TLS fingerprint
-    api_url = f"https://i.instagram.com/api/v1/media/shortcode/{shortcode}/info/"
-    
     try:
         resp = cffi_requests.get(
-            api_url,
+            embed_url,
             headers=headers,
-            cookies=cookies,
             proxies=proxies,
             impersonate="chrome131",
             timeout=15,
@@ -506,71 +489,76 @@ def extract_instagram_media(url: str) -> dict:
         raise HTTPException(status_code=500, detail=f"Network request failed: {str(e)}")
     
     if resp.status_code == 404:
-        raise HTTPException(status_code=404, detail="Post not found or deleted.")
-    if resp.status_code == 401 or resp.status_code == 403:
-        raise HTTPException(status_code=403, detail="Instagram is blocking this request. Please update your cookies (IG_COOKIES_PHOTO_1).")
+        raise HTTPException(status_code=404, detail="Instagram post not found or deleted.")
     if resp.status_code != 200:
-        raise HTTPException(status_code=500, detail=f"Instagram returned HTTP {resp.status_code}.")
+        raise HTTPException(status_code=500, detail=f"Instagram embed page returned HTTP {resp.status_code}.")
     
-    # 6. Parse the JSON response
-    try:
-        data = resp.json()
-    except Exception:
-        raise HTTPException(status_code=500, detail="Instagram returned an invalid response.")
+    text = resp.text
     
-    items = data.get("items") or []
-    if not items:
-        raise HTTPException(status_code=400, detail="No media found in this post.")
+    # 3. Extract high-res CDN image URLs
+    # t51.82787-15 = full-res post content (photos/thumbnails of videos)
+    # t51.71878-15 = also post content
+    # We want URLs that do NOT have small thumbnail markers
+    all_cdn = re.findall(r'https://[^\s"\'<>]+\.(?:fbcdn|cdninstagram)\.net/[^\s"\'<>]+', text)
+    all_cdn = [html_lib.unescape(u) for u in all_cdn]
     
-    item = items[0]
-    media_urls = []
-    owner = item.get("user", {}).get("username", "unknown")
-    thumbnail = ""
+    # Separate high-quality from low-quality
+    def quality_score(u: str) -> int:
+        """Higher = better quality."""
+        if any(x in u for x in ['p1080x1080', 'p720x720', 'e35', 'dst-jpg_e35']):
+            return 3
+        if any(x in u for x in ['p480x480', 'e15_s640', 'dst-jpg_e15&']):
+            return 2
+        if any(x in u for x in ['p240x240', 's150x150', 'p320x320', 'e15_p', 's100x100']):
+            return -1  # Low quality, skip
+        return 1
     
-    media_type = item.get("media_type")  # 1=photo, 2=video, 8=carousel
+    # Only keep actual post media (t51.82787-15 = post images, t51.71878-15 = alternate)
+    # Filter out profile pictures (t51.2885-19)
+    post_media = [
+        u for u in all_cdn
+        if ('t51.82787-15' in u or 't51.71878-15' in u) and quality_score(u) >= 1
+    ]
     
-    def best_image_url(candidates: list) -> str:
-        """Pick the highest-resolution image from candidates list."""
-        if not candidates:
-            return ""
-        best = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
-        return best.get("url", "")
+    # Deduplicate by base filename
+    seen_bases = set()
+    unique_media = []
+    for u in post_media:
+        # Extract base filename (before query string)
+        base = re.search(r'/(\d+_[^/?]+\.(?:jpg|jpeg|png|heic|mp4))', u)
+        key = base.group(1) if base else u.split('?')[0]
+        if key not in seen_bases:
+            seen_bases.add(key)
+            unique_media.append(u)
     
-    if media_type == 8:  # Carousel
-        for node in item.get("carousel_media") or []:
-            node_type = node.get("media_type")
-            if node_type == 2:  # video
-                video_versions = node.get("video_versions") or []
-                if video_versions:
-                    media_urls.append(video_versions[0]["url"])
-            else:  # photo
-                candidates = node.get("image_versions2", {}).get("candidates") or []
-                img_url = best_image_url(candidates)
-                if img_url:
-                    media_urls.append(img_url)
-    elif media_type == 2:  # Single video
-        video_versions = item.get("video_versions") or []
-        if video_versions:
-            media_urls.append(video_versions[0]["url"])
-    else:  # Single photo
-        candidates = item.get("image_versions2", {}).get("candidates") or []
-        img_url = best_image_url(candidates)
-        if img_url:
-            media_urls.append(img_url)
+    # 4. Also check for video URLs
+    # Videos in embed pages typically appear as mp4 in src attributes
+    video_urls = re.findall(r'src="(https://[^"]+\.mp4[^"]*)"', text)
+    video_urls = [html_lib.unescape(v) for v in video_urls]
     
-    # Thumbnail
-    candidates = item.get("image_versions2", {}).get("candidates") or []
-    thumbnail = best_image_url(candidates) if candidates else (media_urls[0] if media_urls else "")
+    # Combine: images first, videos appended
+    media_urls = unique_media + [v for v in video_urls if v not in unique_media]
     
     if not media_urls:
-        raise HTTPException(status_code=400, detail="No downloadable media found in this post.")
+        # Last resort: try og:image from the page
+        og_match = re.search(r'property="og:image"\s+content="([^"]+)"', text)
+        if og_match:
+            media_urls = [html_lib.unescape(og_match.group(1))]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not extract media from this Instagram post. It may be private or login-required."
+            )
+    
+    thumbnail = media_urls[0] if media_urls else ""
     
     return {
         "media_type": "carousel",
         "media_urls": media_urls,
-        "Video Title": f"Post by @{owner}",
+        "Video Title": "Instagram Post",
         "Thumbnail URL": thumbnail,
     }
+
 
 
 @app.get("/extract")
