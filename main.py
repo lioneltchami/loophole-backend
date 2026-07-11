@@ -486,7 +486,7 @@ def extract_instagram_media(url: str) -> dict:
             timeout=15,
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Network request failed: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Instagram is temporarily unavailable. Please try again later. (Error: {str(e)})")
     
     if resp.status_code == 404:
         raise HTTPException(status_code=404, detail="Instagram post not found or deleted.")
@@ -585,7 +585,7 @@ def extract_instagram_media(url: str) -> dict:
                 return -1
             return 1
             
-        post_media = [u for u in all_cdn if ('t51.82787-15' in u or 't51.71878-15' in u) and quality_score(u) >= 1]
+        post_media = [u for u in all_cdn if quality_score(u) >= 1]
         
         # We only take the FIRST valid image found (which is the main post's image).
         # Otherwise, the regex picks up the 'See more' preview posts at the bottom of the page.
@@ -662,7 +662,12 @@ def extract_video(
             
         # --- INSTAGRAM /p/ : curl_cffi Chrome-impersonation extractor ---
         if "/p/" in url_lower and "instagram.com" in url_lower:
-            return extract_instagram_media(url_decoded)
+            try:
+                return extract_instagram_media(url_decoded)
+            except Exception as e:
+                print(f"Primary instagram extractor failed: {e}. Falling back to yt-dlp pipeline...")
+                # Fall through to yt-dlp logic below
+                pass
         
         # --- PINTEREST: try yt-dlp, fallback later ---
         if "pinterest.com" in url_lower or "pin.it" in url_lower:
