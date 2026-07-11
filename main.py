@@ -495,65 +495,124 @@ def extract_instagram_media(url: str) -> dict:
     
     text = resp.text
     
-    # 3. Extract high-res CDN image URLs
-    # t51.82787-15 = full-res post content (photos/thumbnails of videos)
-    # t51.71878-15 = also post content
-    # We want URLs that do NOT have small thumbnail markers
-    all_cdn = re.findall(r'https://[^\s"\'<>]+\.(?:fbcdn|cdninstagram)\.net/[^\s"\'<>]+', text)
-    all_cdn = [html_lib.unescape(u) for u in all_cdn]
+    media_urls = []
+    media_type = "photo"
+    thumbnail = ""
     
-    # Separate high-quality from low-quality
-    def quality_score(u: str) -> int:
-        """Higher = better quality."""
-        if any(x in u for x in ['p1080x1080', 'p720x720', 'e35', 'dst-jpg_e35']):
-            return 3
-        if any(x in u for x in ['p480x480', 'e15_s640', 'dst-jpg_e15&']):
-            return 2
-        if any(x in u for x in ['p240x240', 's150x150', 'p320x320', 'e15_p', 's100x100']):
-            return -1  # Low quality, skip
-        return 1
+    # 3. Find the exact JSON payload in the embed HTML
+    start_str = r'\"shortcode_media\":{'
+    idx = text.find(start_str)
+    if idx == -1:
+        start_str = r'"shortcode_media":{'
+        idx = text.find(start_str)
+
+    if idx != -1:
+        json_start = idx + len(start_str) - 1
+        brace_count = 0
+        in_string = False
+        escape_next = False
+        json_end = -1
+        
+        for i in range(json_start, len(text)):
+            char = text[i]
+            if escape_next:
+                escape_next = False
+                continue
+            if char == '\\':
+                escape_next = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+                
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_end = i + 1
+                        break
+                        
+        if json_end != -1:
+            raw_json = text[json_start:json_end]
+            if '\\"' in raw_json:
+                clean_json = raw_json.replace('\\"', '"').replace('\\\\', '\\').replace('\\/', '/')
+            else:
+                clean_json = raw_json
+                
+            try:
+                import json
+                media = json.loads(clean_json)
+                typename = media.get("__typename", "")
+                
+                if typename == "GraphSidecar":
+                    media_type = "carousel"
+                    edges = media.get("edge_sidecar_to_children", {}).get("edges", [])
+                    for edge in edges:
+                        node = edge.get("node", {})
+                        if node.get("is_video") and "video_url" in node:
+                            media_urls.append(node["video_url"])
+                        elif "display_url" in node:
+                            media_urls.append(node["display_url"])
+                elif typename == "GraphVideo" or media.get("is_video"):
+                    media_type = "video"
+                    if "video_url" in media:
+                        media_urls.append(media["video_url"])
+                    elif "display_url" in media:
+                        media_urls.append(media["display_url"])
+                else:
+                    media_type = "photo"
+                    if "display_url" in media:
+                        media_urls.append(media["display_url"])
+                
+                if "display_url" in media:
+                    thumbnail = media["display_url"]
+            except Exception:
+                pass
     
-    # Only keep actual post media (t51.82787-15 = post images, t51.71878-15 = alternate)
-    # Filter out profile pictures (t51.2885-19)
-    post_media = [
-        u for u in all_cdn
-        if ('t51.82787-15' in u or 't51.71878-15' in u) and quality_score(u) >= 1
-    ]
-    
-    # Deduplicate by base filename
-    seen_bases = set()
-    unique_media = []
-    for u in post_media:
-        # Extract base filename (before query string)
-        base = re.search(r'/(\d+_[^/?]+\.(?:jpg|jpeg|png|heic|mp4))', u)
-        key = base.group(1) if base else u.split('?')[0]
-        if key not in seen_bases:
-            seen_bases.add(key)
-            unique_media.append(u)
-    
-    # 4. Also check for video URLs
-    # Videos in embed pages typically appear as mp4 in src attributes
-    video_urls = re.findall(r'src="(https://[^"]+\.mp4[^"]*)"', text)
-    video_urls = [html_lib.unescape(v) for v in video_urls]
-    
-    # Combine: images first, videos appended
-    media_urls = unique_media + [v for v in video_urls if v not in unique_media]
-    
+    # 4. Fallback if JSON parsing fails
     if not media_urls:
-        # Last resort: try og:image from the page
-        og_match = re.search(r'property="og:image"\s+content="([^"]+)"', text)
-        if og_match:
-            media_urls = [html_lib.unescape(og_match.group(1))]
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="Could not extract media from this Instagram post. It may be private or login-required."
-            )
-    
-    thumbnail = media_urls[0] if media_urls else ""
-    
+        all_cdn = re.findall(r'https://[^\s"\'<>]+\.(?:fbcdn|cdninstagram)\.net/[^\s"\'<>]+', text)
+        all_cdn = [html_lib.unescape(u) for u in all_cdn]
+        
+        def quality_score(u: str) -> int:
+            if any(x in u for x in ['p1080x1080', 'p720x720', 'e35', 'dst-jpg_e35']):
+                return 3
+            if any(x in u for x in ['p480x480', 'e15_s640', 'dst-jpg_e15&']):
+                return 2
+            if any(x in u for x in ['p240x240', 's150x150', 'p320x320', 'e15_p', 's100x100']):
+                return -1
+            return 1
+            
+        post_media = [u for u in all_cdn if ('t51.82787-15' in u or 't51.71878-15' in u) and quality_score(u) >= 1]
+        
+        seen_bases = set()
+        for u in post_media:
+            base = re.search(r'/(\d+_[^/?]+\.(?:jpg|jpeg|png|heic|mp4))', u)
+            key = base.group(1) if base else u.split('?')[0]
+            if key not in seen_bases:
+                seen_bases.add(key)
+                media_urls.append(u)
+                
+        video_urls = re.findall(r'src="(https://[^"]+\.mp4[^"]*)"', text)
+        video_urls = [html_lib.unescape(v) for v in video_urls]
+        for v in video_urls:
+            if v not in media_urls:
+                media_urls.append(v)
+                
+        if not media_urls:
+            og_match = re.search(r'property="og:image"\s+content="([^"]+)"', text)
+            if og_match:
+                media_urls = [html_lib.unescape(og_match.group(1))]
+            else:
+                raise HTTPException(status_code=400, detail="Could not extract media. The post may be private.")
+                
+        thumbnail = media_urls[0] if media_urls else ""
+        media_type = "carousel" if len(media_urls) > 1 else "photo"
+
     return {
-        "media_type": "carousel",
+        "media_type": media_type,
         "media_urls": media_urls,
         "Video Title": "Instagram Post",
         "Thumbnail URL": thumbnail,
