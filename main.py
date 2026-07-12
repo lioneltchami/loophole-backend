@@ -729,6 +729,15 @@ def extract_video(
                     detail="This content is private or age-restricted."
                 )
             
+            # Check for Facebook video format that yt-dlp cannot currently parse
+            # This happens with old-style Facebook /videos/ posts (not Reels)
+            if "cannot parse data" in primary_msg.lower() and any(fb in url_decoded.lower() for fb in ["facebook.com", "fb.watch", "fb.gg"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Sorry, this specific Facebook video format is currently unsupported. Try sharing a Facebook Reel instead."
+                )
+
+            
             # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
             if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
                 is_photo_fallback = True
