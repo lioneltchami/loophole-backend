@@ -458,7 +458,7 @@ def extract_instagram_media(url: str) -> dict:
     import re, html as html_lib
     
     # 1. Extract shortcode
-    match = re.search(r'/(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', url)
+    match = re.search(r'/p/([A-Za-z0-9_-]+)', url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid Instagram post URL.")
     shortcode = match.group(1)
@@ -660,8 +660,8 @@ def extract_video(
                 detail="Please copy a link to a specific video or post, not the homepage!"
             )
             
-        # --- INSTAGRAM: curl_cffi Chrome-impersonation extractor ---
-        if "instagram.com" in url_lower and any(x in url_lower for x in ["/p/", "/reel/", "/reels/", "/tv/"]):
+        # --- INSTAGRAM /p/ : curl_cffi Chrome-impersonation extractor ---
+        if "/p/" in url_lower and "instagram.com" in url_lower:
             try:
                 return extract_instagram_media(url_decoded)
             except Exception as e:
