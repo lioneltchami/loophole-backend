@@ -215,73 +215,128 @@ def get_cookies_path(url: str = "") -> str:
         
     return None
 
-def get_writable_cookies_path(url: str = "") -> str:
+def _write_env_cookie_to_temp(env_var: str, filename: str) -> str:
+    """Helper: write an env var cookie string to a temp writable file. Returns path or None."""
+    content = os.environ.get(env_var)
+    if not content:
+        return None
+    try:
+        temp_dir = tempfile.gettempdir()
+        writable_path = os.path.join(temp_dir, filename)
+        cookie_content = content.strip()
+        if not cookie_content.startswith("# Netscape HTTP Cookie File"):
+            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+        with open(writable_path, "w", encoding="utf-8") as f:
+            f.write(cookie_content)
+        os.chmod(writable_path, 0o666)
+        return writable_path
+    except Exception as e:
+        print(f"Error writing {env_var} to temp file: {e}")
+        return None
+
+
+def _get_reel_secret_cookie_pool(exclude_path: str = None) -> list:
     """
-    Creates a writable copy of the cookies.txt file inside a temporary directory.
-    For Instagram photo/carousel URLs (/p/), tries IG_COOKIES_PHOTO_1 and 
-    IG_COOKIES_PHOTO_2 first, then falls back to IG_COOKIES.
-    For all other Instagram URLs, uses IG_COOKIES directly.
+    Returns a shuffled list of all available Instagram cookie files from /etc/secrets.
+    Excludes the specified path to allow retry with a different cookie.
+    """
+    filenames = ["instagram_cookies.txt", "cookies.txt", "cookies2.txt",
+                 "cookies3.txt", "cookies4.txt", "cookies5.txt"]
+    directories = ["/etc/secrets", "."]
+    paths = []
+    for directory in directories:
+        for filename in filenames:
+            full_path = os.path.join(directory, filename)
+            if os.path.exists(full_path) and full_path != exclude_path:
+                paths.append(full_path)
+    unique_paths = list(set(paths))
+    random.shuffle(unique_paths)
+    return unique_paths
+
+
+def get_writable_cookies_path(url: str = "", exclude_path: str = None) -> str:
+    """
+    Returns a writable cookie file path for the given URL.
+
+    Priority for Instagram /p/ (photo/carousel):
+      1. IG_COOKIES_PHOTO_1 (env var)
+      2. IG_COOKIES_PHOTO_2 (env var)
+      3. /etc/secrets photo files (if any)
+      4. IG_COOKIES (env var, absolute last resort)
+
+    Priority for Instagram /reel/, /stories/, etc:
+      1. Randomly selected file from /etc/secrets pool (ROTATION)
+      2. IG_COOKIES (env var, absolute last resort ONLY if no files found)
+
+    exclude_path: skip this cookie path (used for retry after a cookie fails)
     """
     url_lower = url.lower()
-    
-    # 1. Check if 'IG_COOKIES' environment variable is provided, ONLY for Instagram
+
     if "instagram.com" in url_lower:
-        
-        # For photo/carousel posts, try the dedicated photo cookies first
         is_photo_url = "/p/" in url_lower
+
         if is_photo_url:
-            # Try PHOTO_1 -> PHOTO_2 -> IG_COOKIES (fallback chain)
-            cookie_env_candidates = [
-                ("IG_COOKIES_PHOTO_1", "ytdlp_photo_cookies_1.txt"),
-                ("IG_COOKIES_PHOTO_2", "ytdlp_photo_cookies_2.txt"),
-                ("IG_COOKIES",         "ytdlp_writable_cookies.txt"),
-            ]
-        else:
-            # For Reels, Stories etc. use the main IG_COOKIES only
-            cookie_env_candidates = [
-                ("IG_COOKIES", "ytdlp_writable_cookies.txt"),
-            ]
-        
-        for env_var, filename in cookie_env_candidates:
-            ig_cookies = os.environ.get(env_var)
-            if ig_cookies:
+            # --- PHOTO: Try dedicated photo env vars first, then fallback ---
+            for env_var, fname in [("IG_COOKIES_PHOTO_1", "ytdlp_photo_cookies_1.txt"),
+                                   ("IG_COOKIES_PHOTO_2", "ytdlp_photo_cookies_2.txt")]:
+                path = _write_env_cookie_to_temp(env_var, fname)
+                if path:
+                    print(f"[Cookie] Photo: using {env_var}")
+                    return path
+            # Then try file pool (for photo files if any exist)
+            pool = _get_reel_secret_cookie_pool(exclude_path=exclude_path)
+            if pool:
+                chosen = pool[0]
+                print(f"[Cookie] Photo fallback: rotating to file {os.path.basename(chosen)}")
                 try:
                     temp_dir = tempfile.gettempdir()
-                    writable_path = os.path.join(temp_dir, filename)
-                    
-                    cookie_content = ig_cookies.strip()
-                    if not cookie_content.startswith("# Netscape HTTP Cookie File"):
-                        cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
-                        
-                    with open(writable_path, "w", encoding="utf-8") as f:
-                        f.write(cookie_content)
-                        
-                    os.chmod(writable_path, 0o666)
-                    print(f"Using cookie env var: {env_var}")
-                    return writable_path
+                    writable = os.path.join(temp_dir, f"writable_{os.path.basename(chosen)}")
+                    shutil.copy2(chosen, writable)
+                    os.chmod(writable, 0o666)
+                    return writable
                 except Exception as e:
-                    print(f"Error writing {env_var} to writable temp path: {e}")
-                    continue  # Try the next cookie in the chain
+                    print(f"[Cookie] Error copying photo file cookie: {e}")
+            # Absolute last resort: IG_COOKIES env var
+            path = _write_env_cookie_to_temp("IG_COOKIES", "ytdlp_writable_cookies.txt")
+            if path:
+                print("[Cookie] Photo: last resort IG_COOKIES env var")
+                return path
 
+        else:
+            # --- REEL / STORY: Go DIRECTLY to file rotation pool ---
+            pool = _get_reel_secret_cookie_pool(exclude_path=exclude_path)
+            if pool:
+                chosen = pool[0]  # Already shuffled, pick first
+                print(f"[Cookie] Reel/Story: rotating to file {os.path.basename(chosen)}")
+                try:
+                    temp_dir = tempfile.gettempdir()
+                    writable = os.path.join(temp_dir, f"writable_{os.path.basename(chosen)}")
+                    shutil.copy2(chosen, writable)
+                    os.chmod(writable, 0o666)
+                    return writable
+                except Exception as e:
+                    print(f"[Cookie] Error copying reel cookie file: {e}")
+            # Absolute last resort: IG_COOKIES env var (only if NO files found in pool)
+            path = _write_env_cookie_to_temp("IG_COOKIES", "ytdlp_writable_cookies.txt")
+            if path:
+                print("[Cookie] Reel/Story: no files found, using IG_COOKIES env var as last resort")
+                return path
 
-    # 2. Fallback to reading cookies from file paths
+    # Non-Instagram: use existing file-based path
     source_path = get_cookies_path(url)
     if not source_path:
         return None
-        
     try:
         temp_dir = tempfile.gettempdir()
         filename_base = os.path.basename(source_path)
         writable_path = os.path.join(temp_dir, f"writable_{filename_base}")
-        
-        # Copy to the writable temp directory
         shutil.copy2(source_path, writable_path)
         os.chmod(writable_path, 0o666)
-        
         return writable_path
     except Exception as e:
         print(f"Error copying cookies to writable path: {e}")
         return source_path
+
 
 def extract_with_ytdlp(url: str, user_agent: str = None, use_cookies: bool = True) -> dict:
     """
