@@ -660,7 +660,27 @@ def extract_video(
                 detail="Please copy a link to a specific video or post, not the homepage!"
             )
             
-        # --- INSTAGRAM /p/ : curl_cffi Chrome-impersonation extractor ---
+        # --- REJECT unsupported Instagram URL types immediately ---
+        # These are listing/browse pages, not downloadable content.
+        # Catching them early prevents noisy multi-fallback log spam.
+        if "instagram.com" in url_lower:
+            unsupported_ig_paths = [
+                "/reels/audio/",  # Audio trending page (not a video)
+                "/explore/",      # Explore browse page
+                "/hashtag/",      # Hashtag browse page
+                "/stories/highlights/",  # Story highlights browser
+            ]
+            # Also reject plain profile pages: instagram.com/username/ with no /p/ /reel/ etc
+            is_profile_only = not any(x in url_lower for x in ["/p/", "/reel/", "/reels/", "/tv/", "/stories/"])
+            is_unsupported_path = any(p in url_lower for p in unsupported_ig_paths)
+            
+            # Catch profile pages (e.g. instagram.com/cristiano/)
+            if is_unsupported_path:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This Instagram link is not downloadable. Please share a link to a specific Post, Reel, or Story — not an audio page, explore page, or profile."
+                )
+            
         if "/p/" in url_lower and "instagram.com" in url_lower:
             try:
                 return extract_instagram_media(url_decoded)
