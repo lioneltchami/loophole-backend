@@ -218,28 +218,51 @@ def get_cookies_path(url: str = "") -> str:
 def get_writable_cookies_path(url: str = "") -> str:
     """
     Creates a writable copy of the cookies.txt file inside a temporary directory.
+    For Instagram photo/carousel URLs (/p/), tries IG_COOKIES_PHOTO_1 and 
+    IG_COOKIES_PHOTO_2 first, then falls back to IG_COOKIES.
+    For all other Instagram URLs, uses IG_COOKIES directly.
     """
     url_lower = url.lower()
     
     # 1. Check if 'IG_COOKIES' environment variable is provided, ONLY for Instagram
     if "instagram.com" in url_lower:
-        ig_cookies = os.environ.get("IG_COOKIES")
-        if ig_cookies:
-            try:
-                temp_dir = tempfile.gettempdir()
-                writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
-                
-                cookie_content = ig_cookies.strip()
-                if not cookie_content.startswith("# Netscape HTTP Cookie File"):
-                    cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+        
+        # For photo/carousel posts, try the dedicated photo cookies first
+        is_photo_url = "/p/" in url_lower
+        if is_photo_url:
+            # Try PHOTO_1 -> PHOTO_2 -> IG_COOKIES (fallback chain)
+            cookie_env_candidates = [
+                ("IG_COOKIES_PHOTO_1", "ytdlp_photo_cookies_1.txt"),
+                ("IG_COOKIES_PHOTO_2", "ytdlp_photo_cookies_2.txt"),
+                ("IG_COOKIES",         "ytdlp_writable_cookies.txt"),
+            ]
+        else:
+            # For Reels, Stories etc. use the main IG_COOKIES only
+            cookie_env_candidates = [
+                ("IG_COOKIES", "ytdlp_writable_cookies.txt"),
+            ]
+        
+        for env_var, filename in cookie_env_candidates:
+            ig_cookies = os.environ.get(env_var)
+            if ig_cookies:
+                try:
+                    temp_dir = tempfile.gettempdir()
+                    writable_path = os.path.join(temp_dir, filename)
                     
-                with open(writable_path, "w", encoding="utf-8") as f:
-                    f.write(cookie_content)
-                    
-                os.chmod(writable_path, 0o666)
-                return writable_path
-            except Exception as e:
-                print(f"Error writing IG_COOKIES to writable temp path: {e}")
+                    cookie_content = ig_cookies.strip()
+                    if not cookie_content.startswith("# Netscape HTTP Cookie File"):
+                        cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
+                        
+                    with open(writable_path, "w", encoding="utf-8") as f:
+                        f.write(cookie_content)
+                        
+                    os.chmod(writable_path, 0o666)
+                    print(f"Using cookie env var: {env_var}")
+                    return writable_path
+                except Exception as e:
+                    print(f"Error writing {env_var} to writable temp path: {e}")
+                    continue  # Try the next cookie in the chain
+
 
     # 2. Fallback to reading cookies from file paths
     source_path = get_cookies_path(url)
