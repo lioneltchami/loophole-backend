@@ -215,134 +215,46 @@ def get_cookies_path(url: str = "") -> str:
         
     return None
 
-import time
-
-CURRENT_REEL_COOKIE_INDEX = 0
-LAST_REEL_COOKIE_RESET = time.time()
-
-CURRENT_PHOTO_COOKIE_INDEX = 0
-LAST_PHOTO_COOKIE_RESET = time.time()
-
-def _write_env_cookie_to_temp(env_var: str, filename: str) -> str:
-    """Helper: write an env var cookie string to a temp writable file. Returns path or None."""
-    content = os.environ.get(env_var)
-    if not content:
-        return None
-    try:
-        temp_dir = tempfile.gettempdir()
-        writable_path = os.path.join(temp_dir, filename)
-        cookie_content = content.strip()
-        if not cookie_content.startswith("# Netscape HTTP Cookie File"):
-            cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
-        with open(writable_path, "w", encoding="utf-8") as f:
-            f.write(cookie_content)
-        os.chmod(writable_path, 0o666)
-        return writable_path
-    except Exception as e:
-        print(f"Error writing {env_var} to temp file: {e}")
-        return None
-
-
-def _get_reel_secret_cookie_pool() -> list:
-    """
-    Returns a sorted list of all available Instagram cookie files from /etc/secrets.
-    Order: cookies.txt, cookies2.txt, cookies3.txt, cookies4.txt, cookies5.txt, instagram_cookies.txt
-    """
-    filenames = ["cookies.txt", "cookies2.txt", "cookies3.txt", "cookies4.txt", "cookies5.txt", "instagram_cookies.txt"]
-    directories = ["/etc/secrets", "."]
-    paths = []
-    for directory in directories:
-        for filename in filenames:
-            full_path = os.path.join(directory, filename)
-            if os.path.exists(full_path):
-                paths.append(full_path)
-    
-    unique_paths = []
-    for p in paths:
-        if p not in unique_paths:
-            unique_paths.append(p)
-            
-    return unique_paths
-
-def advance_cookie_index(is_photo: bool):
-    global CURRENT_REEL_COOKIE_INDEX, CURRENT_PHOTO_COOKIE_INDEX
-    if is_photo:
-        CURRENT_PHOTO_COOKIE_INDEX += 1
-    else:
-        CURRENT_REEL_COOKIE_INDEX += 1
-
-
 def get_writable_cookies_path(url: str = "") -> str:
     """
-    Returns a writable cookie file path for the given URL using Sticky logic.
+    Creates a writable copy of the cookies.txt file inside a temporary directory.
     """
     url_lower = url.lower()
-
+    
+    # 1. Check if 'IG_COOKIES' environment variable is provided, ONLY for Instagram
     if "instagram.com" in url_lower:
-        is_photo_url = "/p/" in url_lower
-
-        if is_photo_url:
-            global CURRENT_PHOTO_COOKIE_INDEX, LAST_PHOTO_COOKIE_RESET
-            if time.time() - LAST_PHOTO_COOKIE_RESET > 86400:
-                CURRENT_PHOTO_COOKIE_INDEX = 0
-                LAST_PHOTO_COOKIE_RESET = time.time()
-                print("[Cookie] 24 hours passed, resetting Photo cookie index to 0")
-
-            candidates = [
-                ("IG_COOKIES_PHOTO_1", "ytdlp_photo_cookies_1.txt"),
-                ("IG_COOKIES_PHOTO_2", "ytdlp_photo_cookies_2.txt")
-            ]
-            
-            idx = CURRENT_PHOTO_COOKIE_INDEX % len(candidates)
-            env_var, fname = candidates[idx]
-            path = _write_env_cookie_to_temp(env_var, fname)
-            if path:
-                print(f"[Cookie] Photo: using {env_var} (index {idx})")
-                return path
-
-            # Absolute last resort: IG_COOKIES env var
-            path = _write_env_cookie_to_temp("IG_COOKIES", "ytdlp_writable_cookies.txt")
-            if path:
-                print("[Cookie] Photo: last resort IG_COOKIES env var")
-                return path
-
-        else:
-            global CURRENT_REEL_COOKIE_INDEX, LAST_REEL_COOKIE_RESET
-            if time.time() - LAST_REEL_COOKIE_RESET > 86400:
-                CURRENT_REEL_COOKIE_INDEX = 0
-                LAST_REEL_COOKIE_RESET = time.time()
-                print("[Cookie] 24 hours passed, resetting Reel/Story cookie index to 0")
-
-            pool = _get_reel_secret_cookie_pool()
-            if pool:
-                idx = CURRENT_REEL_COOKIE_INDEX % len(pool)
-                chosen = pool[idx]
-                print(f"[Cookie] Reel/Story: using file {os.path.basename(chosen)} (index {idx})")
-                try:
-                    temp_dir = tempfile.gettempdir()
-                    writable = os.path.join(temp_dir, f"writable_{os.path.basename(chosen)}")
-                    shutil.copy2(chosen, writable)
-                    os.chmod(writable, 0o666)
-                    return writable
-                except Exception as e:
-                    print(f"[Cookie] Error copying reel cookie file: {e}")
+        ig_cookies = os.environ.get("IG_COOKIES")
+        if ig_cookies:
+            try:
+                temp_dir = tempfile.gettempdir()
+                writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
+                
+                cookie_content = ig_cookies.strip()
+                if not cookie_content.startswith("# Netscape HTTP Cookie File"):
+                    cookie_content = "# Netscape HTTP Cookie File\n" + cookie_content
                     
-            # Absolute last resort: IG_COOKIES env var (only if NO files found in pool)
-            path = _write_env_cookie_to_temp("IG_COOKIES", "ytdlp_writable_cookies.txt")
-            if path:
-                print("[Cookie] Reel/Story: no files found, using IG_COOKIES env var as last resort")
-                return path
+                with open(writable_path, "w", encoding="utf-8") as f:
+                    f.write(cookie_content)
+                    
+                os.chmod(writable_path, 0o666)
+                return writable_path
+            except Exception as e:
+                print(f"Error writing IG_COOKIES to writable temp path: {e}")
 
-    # Non-Instagram: use existing file-based path
+    # 2. Fallback to reading cookies from file paths
     source_path = get_cookies_path(url)
     if not source_path:
         return None
+        
     try:
         temp_dir = tempfile.gettempdir()
         filename_base = os.path.basename(source_path)
         writable_path = os.path.join(temp_dir, f"writable_{filename_base}")
+        
+        # Copy to the writable temp directory
         shutil.copy2(source_path, writable_path)
         os.chmod(writable_path, 0o666)
+        
         return writable_path
     except Exception as e:
         print(f"Error copying cookies to writable path: {e}")
@@ -383,32 +295,22 @@ def extract_with_ytdlp(url: str, user_agent: str = None, use_cookies: bool = Tru
     if headers:
         ydl_opts['http_headers'] = headers
         
-    retries = 1
-    for attempt in range(retries + 1):
-        if use_cookies:
-            cookies_path = get_writable_cookies_path(url)
-            if cookies_path:
-                ydl_opts['cookiefile'] = cookies_path
-            
-        try:
+    if use_cookies:
+        cookies_path = get_writable_cookies_path(url)
+        if cookies_path:
+            ydl_opts['cookiefile'] = cookies_path
+        
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
+            ydl_opts.pop("proxy", None)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # Check for cookie/login failures
-            if use_cookies and any(k in error_msg for k in ["403", "429", "rate limit", "login", "sign in", "bot", "auth", "checkpoint"]):
-                if attempt < retries:
-                    is_photo = "/p/" in url.lower()
-                    advance_cookie_index(is_photo)
-                    continue  # Retry with new cookie
-                    
-            if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
-                ydl_opts.pop("proxy", None)
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-            else:
-                raise e
+        else:
+            raise e
 
 def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = True) -> dict:
     """
@@ -441,32 +343,22 @@ def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = 
     if headers:
         ydl_opts['http_headers'] = headers
         
-    retries = 1
-    for attempt in range(retries + 1):
-        if use_cookies:
-            cookies_path = get_writable_cookies_path(url)
-            if cookies_path:
-                ydl_opts['cookiefile'] = cookies_path
-            
-        try:
+    if use_cookies:
+        cookies_path = get_writable_cookies_path(url)
+        if cookies_path:
+            ydl_opts['cookiefile'] = cookies_path
+        
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
+            ydl_opts.pop("proxy", None)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 return ydl.extract_info(url, download=False)
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # Check for cookie/login failures
-            if use_cookies and any(k in error_msg for k in ["403", "429", "rate limit", "login", "sign in", "bot", "auth", "checkpoint"]):
-                if attempt < retries:
-                    is_photo = "/p/" in url.lower()
-                    advance_cookie_index(is_photo)
-                    continue  # Retry with new cookie
-                    
-            if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
-                ydl_opts.pop("proxy", None)
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-            else:
-                raise e
+        else:
+            raise e
 
 def send_telegram_alert(message: str):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
