@@ -761,7 +761,20 @@ def extract_video(
         is_photo_fallback = False
 
         is_hybrid_platform = any(domain in url_lower for domain in ["facebook.com", "fb.watch", "fb.gg", "pinterest.com", "pin.it"])
-
+        
+        # --- Facebook Share Link Unwrapper ---
+        # Automatically resolve short share links (e.g. /share/v/) to their true /reel/ or /watch/ URLs
+        # before passing them to yt-dlp, bypassing the "Cannot parse data" errors entirely.
+        if "facebook.com/share/" in url_lower:
+            try:
+                import requests
+                print(f"Facebook share link detected. Attempting to unwrap: {url_decoded}")
+                r = requests.head(url_decoded, allow_redirects=True, timeout=10)
+                url_decoded = r.url
+                url_lower = url_decoded.lower()
+                print(f"Unwrapped Facebook link to: {url_decoded}")
+            except Exception as e:
+                print(f"Failed to unwrap Facebook share link: {e}. Proceeding with original URL.")
         # 1. Primary extraction with or without cookies
         try:
             if is_hybrid_platform:
