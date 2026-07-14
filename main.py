@@ -398,33 +398,89 @@ def fallback_instagram_scrape_generic(url: str, use_cookies: bool = True) -> dic
     except Exception as e:
         raise Exception(f"Fallback mobile generic scraper also failed: {str(e)}")
 
-def scrape_instagram_fallback(url: str) -> dict:
+def extract_photo_with_gallery_dl(url: str) -> dict:
     """
-    Lightweight fallback HTML scraper for Instagram.
-    Fetches the raw page and extracts the og:image meta tag.
+    Bulletproof fallback for Instagram photos/carousels using gallery-dl.
+    Executes in a completely isolated subprocess so it cannot affect yt-dlp video state.
     """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-    }
-    response = requests.get(url, headers=headers, timeout=10)
-    if response.status_code != 200:
-        raise Exception(f"Failed to fetch Instagram page: HTTP {response.status_code}")
-        
-    soup = BeautifulSoup(response.text, 'html.parser')
-    meta_tag = soup.find('meta', property='og:image')
-    if not meta_tag or not meta_tag.get('content'):
-        raise Exception("Could not find og:image meta tag on Instagram page")
-        
-    img_url = meta_tag['content']
+    proxy_url = os.environ.get("PROXY_URL")
     
-    return {
-        "title": "Instagram Photo",
-        "thumbnail": img_url,
-        "url": img_url,
-        "ext": "jpg",
-    }
+    import random
+    import sys
+    import subprocess
+    import json
+    
+    cookie_vars = []
+    if os.environ.get("IG_COOKIES_PHOTO_1"): cookie_vars.append("IG_COOKIES_PHOTO_1")
+    if os.environ.get("IG_COOKIES_PHOTO_2"): cookie_vars.append("IG_COOKIES_PHOTO_2")
+    
+    chosen_cookie = random.choice(cookie_vars) if cookie_vars else "IG_COOKIES"
+    cookie_content = os.environ.get(chosen_cookie)
+    
+    cmd = [sys.executable, "-m", "gallery_dl", "-j", url]
+    
+    if proxy_url:
+        cmd.extend(["--proxy", proxy_url])
+        
+    temp_cookie_path = None
+    if cookie_content:
+        try:
+            temp_dir = tempfile.gettempdir()
+            temp_cookie_path = os.path.join(temp_dir, f"gallery_dl_cookie_{random.randint(1000,9999)}.txt")
+            content = cookie_content.strip()
+            if not content.startswith("# Netscape"):
+                content = "# Netscape HTTP Cookie File\n" + content
+            with open(temp_cookie_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            cmd.extend(["--cookies", temp_cookie_path])
+        except Exception as e:
+            print(f"Failed to write gallery-dl cookie: {e}")
+            
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise Exception(f"gallery-dl failed (code {result.returncode}): {result.stderr.strip()}")
+            
+        data = json.loads(result.stdout)
+        if not data or not isinstance(data, list):
+            raise Exception("gallery-dl returned empty or invalid json list")
+            
+        # Parse output
+        media_urls = []
+        thumbnail = ""
+        for item in data:
+            if len(item) == 2 and isinstance(item[1], dict):
+                meta = item[1]
+                url_val = meta.get("url")
+                if url_val:
+                    media_urls.append(url_val)
+                    if not thumbnail:
+                        thumbnail = url_val
+                        
+        if not media_urls:
+            raise Exception("No media URLs found in gallery-dl output")
+            
+        formats = []
+        for u in media_urls:
+            formats.append({
+                "Extension": "jpg",
+                "Has Audio": False,
+                "Resolution": "High Res",
+                "Direct Download Link": u
+            })
+            
+        return {
+            "Title": "Instagram Photo",
+            "Thumbnail": thumbnail,
+            "Formats": formats,
+            "Total Files": len(media_urls)
+        }
+    finally:
+        if temp_cookie_path and os.path.exists(temp_cookie_path):
+            try:
+                os.remove(temp_cookie_path)
+            except:
+                pass
 
 
 
@@ -687,9 +743,15 @@ def extract_video(
             try:
                 return extract_instagram_media(url_decoded)
             except Exception as e:
-                print(f"Primary instagram extractor failed: {e}. Falling back to yt-dlp pipeline...")
-                # Fall through to yt-dlp logic below
-                pass
+                print(f"Primary instagram photo extractor failed: {e}. Falling back to gallery-dl isolated pipeline...")
+                try:
+                    return extract_photo_with_gallery_dl(url_decoded)
+                except Exception as gallery_error:
+                    print(f"gallery-dl photo extraction also failed: {gallery_error}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Failed to extract Instagram photo. If this is a private account, the photo cannot be downloaded."
+                    )
         
         # --- PINTEREST: try yt-dlp, fallback later ---
         if "pinterest.com" in url_lower or "pin.it" in url_lower:
