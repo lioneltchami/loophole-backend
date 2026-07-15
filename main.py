@@ -850,7 +850,7 @@ def extract_video(
                     print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
                     try:
                         clear_ytdlp_cache()
-                        info = fallback_instagram_scrape_generic(url_decoded, use_cookies=True)
+                        info = extract_instagram_media(url_decoded)
                     except Exception as fallback_gen_error:
                         if "instagram.com" in url_decoded:
                             try:
