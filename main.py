@@ -805,6 +805,13 @@ def extract_video(
                     status_code=403,
                     detail="This content is private or age-restricted."
                 )
+                
+            # Instagram specific blocks (Expired cookies manifest as 401/404 or unreachable)
+            if "instagram.com" in url_decoded.lower() and any(err in primary_msg.lower() for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable"]):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Instagram download failed. The post is either deleted, or our server cookies have expired. (Admin: Please update IG_COOKIES in Render)"
+                )
             
             # Check for Facebook video format that yt-dlp cannot currently parse
             # This happens with old-style Facebook /videos/ posts (not Reels)
@@ -852,21 +859,10 @@ def extract_video(
                         clear_ytdlp_cache()
                         info = extract_instagram_media(url_decoded)
                     except Exception as fallback_gen_error:
-                        if "instagram.com" in url_decoded:
-                            try:
-                                print("yt-dlp photo fallback failed completely. Trying custom HTML scraper fallback...")
-                                info = scrape_instagram_fallback(url_decoded)
-                            except Exception as scraper_error:
-                                print(f"Custom Instagram scraper fallback failed: {scraper_error}")
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail=f"Failed to extract Instagram photo/carousel: {str(scraper_error)}"
-                                )
-                        else:
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
-                            )
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                        )
         if not info:
             raise Exception("Failed to extract media info from any source")
             
