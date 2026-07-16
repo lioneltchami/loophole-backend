@@ -824,13 +824,6 @@ def extract_video(
                     detail="This content is private or age-restricted."
                 )
                 
-            # Instagram specific blocks (Expired cookies manifest as 401/404 or unreachable)
-            if "instagram.com" in url_decoded.lower() and any(err in primary_msg.lower() for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response", "400: bad request"]):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Instagram download failed. The post is either private, deleted, or our server cookies have expired."
-                )
-            
             # Check for Facebook video format that yt-dlp cannot currently parse
             # This happens with old-style Facebook /videos/ posts (not Reels)
             if "cannot parse data" in primary_msg.lower() and any(fb in url_decoded.lower() for fb in ["facebook.com", "fb.watch", "fb.gg"]):
@@ -850,7 +843,17 @@ def extract_video(
                     clear_ytdlp_cache()
                     info = fallback_instagram_scrape(url_decoded, use_cookies=True)
                 except Exception as fallback_error:
-                    print(f"Fallback video extraction also failed: {fallback_error}. Trying generic media extraction...")
+                    fallback_msg = str(fallback_error).lower()
+                    print(f"Fallback video extraction also failed: {fallback_msg}. Checking Instagram blocks...")
+                    
+                    # Instagram specific blocks checked ONLY after fallback fails to prevent Chrome UA false-positives
+                    if "instagram.com" in url_decoded.lower() and any(err in fallback_msg for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response", "400: bad request"]):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Instagram download failed. The post is either private, deleted, or our server cookies have expired."
+                        )
+                    
+                    print(f"No specific Instagram block found. Trying generic media extraction...")
                     is_photo_fallback = True
             
             # If we determined we need photo/generic extraction
