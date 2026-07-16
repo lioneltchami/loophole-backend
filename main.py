@@ -825,7 +825,7 @@ def extract_video(
                 )
                 
             # Instagram specific blocks (Expired cookies manifest as 401/404 or unreachable)
-            if "instagram.com" in url_decoded.lower() and any(err in primary_msg.lower() for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable"]):
+            if "instagram.com" in url_decoded.lower() and any(err in primary_msg.lower() for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response"]):
                 raise HTTPException(
                     status_code=400,
                     detail="Instagram download failed. The post is either deleted, or our server cookies have expired. (Admin: Please update IG_COOKIES in Render)"
@@ -841,7 +841,7 @@ def extract_video(
 
             
             # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
-            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "empty media response", "expecting value", "extra data"]):
+            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "expecting value", "extra data"]):
                 is_photo_fallback = True
             
             # If not explicitly a photo fallback, try video fallback first
