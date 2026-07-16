@@ -825,10 +825,10 @@ def extract_video(
                 )
                 
             # Instagram specific blocks (Expired cookies manifest as 401/404 or unreachable)
-            if "instagram.com" in url_decoded.lower() and any(err in primary_msg.lower() for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response"]):
+            if "instagram.com" in url_decoded.lower() and any(err in primary_msg.lower() for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response", "400: bad request"]):
                 raise HTTPException(
                     status_code=400,
-                    detail="Instagram download failed. The post is either deleted, or our server cookies have expired. (Admin: Please update IG_COOKIES in Render)"
+                    detail="Instagram download failed. The post is either private, deleted, or our server cookies have expired."
                 )
             
             # Check for Facebook video format that yt-dlp cannot currently parse
