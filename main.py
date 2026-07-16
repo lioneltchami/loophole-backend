@@ -220,6 +220,8 @@ def get_writable_cookies_path(url: str = "") -> str:
     Creates a writable copy of the cookies.txt file inside a temporary directory.
     """
     url_lower = url.lower()
+    import uuid
+    unique_id = uuid.uuid4().hex
     
     # 1. Check if 'IG_COOKIES' environment variable is provided, ONLY for Instagram
     if "instagram.com" in url_lower:
@@ -227,7 +229,7 @@ def get_writable_cookies_path(url: str = "") -> str:
         if ig_cookies:
             try:
                 temp_dir = tempfile.gettempdir()
-                writable_path = os.path.join(temp_dir, "ytdlp_writable_cookies.txt")
+                writable_path = os.path.join(temp_dir, f"ytdlp_writable_cookies_{unique_id}.txt")
                 
                 cookie_content = ig_cookies.strip()
                 if not cookie_content.startswith("# Netscape HTTP Cookie File"):
@@ -249,7 +251,7 @@ def get_writable_cookies_path(url: str = "") -> str:
     try:
         temp_dir = tempfile.gettempdir()
         filename_base = os.path.basename(source_path)
-        writable_path = os.path.join(temp_dir, f"writable_{filename_base}")
+        writable_path = os.path.join(temp_dir, f"writable_{unique_id}_{filename_base}")
         
         # Copy to the writable temp directory
         shutil.copy2(source_path, writable_path)
@@ -295,6 +297,7 @@ def extract_with_ytdlp(url: str, user_agent: str = None, use_cookies: bool = Tru
     if headers:
         ydl_opts['http_headers'] = headers
         
+    cookies_path = None
     if use_cookies:
         cookies_path = get_writable_cookies_path(url)
         if cookies_path:
@@ -311,6 +314,12 @@ def extract_with_ytdlp(url: str, user_agent: str = None, use_cookies: bool = Tru
                 return ydl.extract_info(url, download=False)
         else:
             raise e
+    finally:
+        if cookies_path and os.path.exists(cookies_path):
+            try:
+                os.remove(cookies_path)
+            except:
+                pass
 
 def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = True) -> dict:
     """
@@ -343,6 +352,7 @@ def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = 
     if headers:
         ydl_opts['http_headers'] = headers
         
+    cookies_path = None
     if use_cookies:
         cookies_path = get_writable_cookies_path(url)
         if cookies_path:
@@ -359,6 +369,12 @@ def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = 
                 return ydl.extract_info(url, download=False)
         else:
             raise e
+    finally:
+        if cookies_path and os.path.exists(cookies_path):
+            try:
+                os.remove(cookies_path)
+            except:
+                pass
 
 def send_telegram_alert(message: str):
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
