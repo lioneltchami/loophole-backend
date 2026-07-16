@@ -441,8 +441,10 @@ def extract_photo_with_gallery_dl(url: str) -> dict:
     temp_cookie_path = None
     if cookie_content:
         try:
+            import uuid
+            unique_id = uuid.uuid4().hex
             temp_dir = tempfile.gettempdir()
-            temp_cookie_path = os.path.join(temp_dir, f"gallery_dl_cookie_{random.randint(1000,9999)}.txt")
+            temp_cookie_path = os.path.join(temp_dir, f"gallery_dl_cookie_{unique_id}.txt")
             content = cookie_content.strip()
             if not content.startswith("# Netscape"):
                 content = "# Netscape HTTP Cookie File\n" + content
