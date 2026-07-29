@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(auto_update_ytdlp())
     yield
 
-app = FastAPI(title="VidgetGo Backend", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="LoopHole Backend", version="1.0.0", lifespan=lifespan)
 
 # Enable CORS for the Flutter client
 app.add_middleware(
