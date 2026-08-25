@@ -175,6 +175,29 @@ def diagnose_cookies_endpoint(request: Request):
         "results": results
     }
 
+def is_tiktok_url(url: str) -> bool:
+    return "tiktok.com" in (url or "").lower()
+
+
+def collect_tiktok_cookies(ydl) -> str:
+    """
+    TikTok signs its CDN playback URLs against the cookies of the session that
+    requested them (see the tk=tt_chain_token parameter), so a client fetching
+    the bare URL gets HTTP 403. Returning the jar lets the app replay the
+    session that the signature was issued for.
+    """
+    try:
+        pairs = []
+        for cookie in ydl.cookiejar:
+            domain = (cookie.domain or "").lstrip(".")
+            if domain.endswith("tiktok.com") and cookie.value:
+                pairs.append(f"{cookie.name}={cookie.value}")
+        return "; ".join(pairs)
+    except Exception as e:
+        print(f"Could not collect TikTok cookies: {e}")
+        return ""
+
+
 def get_cookies_path(url: str = "") -> str:
     """
     Locates available cookies.txt files based on the requested platform.
@@ -304,15 +327,23 @@ def extract_with_ytdlp(url: str, user_agent: str = None, use_cookies: bool = Tru
         if cookies_path:
             ydl_opts['cookiefile'] = cookies_path
         
+    def _run(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and is_tiktok_url(url):
+                cookie_header = collect_tiktok_cookies(ydl)
+                if cookie_header:
+                    info["_download_cookie"] = cookie_header
+                info["_download_user_agent"] = user_agent
+            return info
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
+        return _run(ydl_opts)
     except Exception as e:
         error_msg = str(e).lower()
         if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
             ydl_opts.pop("proxy", None)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
+            return _run(ydl_opts)
         else:
             raise e
     finally:
@@ -359,15 +390,23 @@ def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = 
         if cookies_path:
             ydl_opts['cookiefile'] = cookies_path
         
+    def _run(opts):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info and is_tiktok_url(url):
+                cookie_header = collect_tiktok_cookies(ydl)
+                if cookie_header:
+                    info["_download_cookie"] = cookie_header
+                info["_download_user_agent"] = user_agent
+            return info
+
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
+        return _run(ydl_opts)
     except Exception as e:
         error_msg = str(e).lower()
         if "proxy" in ydl_opts and ("502" in error_msg or "proxy" in error_msg or "ssl" in error_msg or "eof" in error_msg):
             ydl_opts.pop("proxy", None)
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(url, download=False)
+            return _run(ydl_opts)
         else:
             raise e
     finally:
@@ -679,6 +718,42 @@ def extract_video(
             
 
         
+        # --- TikTok Share Link Unwrapper ---
+        # The TikTok app share sheet emits vm./vt. shorteners; yt-dlp handles the
+        # canonical /video/ form far more reliably, so resolve the redirect first.
+        if any(short in url_lower for short in ["vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/"]):
+            try:
+                print(f"TikTok short link detected. Attempting to unwrap: {url_decoded}")
+                r = requests.head(
+                    url_decoded,
+                    allow_redirects=True,
+                    timeout=10,
+                    headers={"User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36"},
+                )
+                if r.url and "tiktok.com" in r.url.lower():
+                    url_decoded = r.url
+                    url_lower = url_decoded.lower()
+                    print(f"Unwrapped TikTok link to: {url_decoded}")
+            except Exception as e:
+                print(f"Failed to unwrap TikTok short link: {e}. Proceeding with original URL.")
+
+        # --- REJECT TikTok URLs that are not a single post ---
+        # Profile, tag, music and live pages are browse surfaces, not downloads.
+        if is_tiktok_url(url_lower) and not any(
+            short in url_lower for short in ["vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/"]
+        ):
+            is_single_post = any(p in url_lower for p in ["/video/", "/photo/", "/v/", "/embed/"])
+            if "/live" in url_lower:
+                raise HTTPException(
+                    status_code=400,
+                    detail="LIVE streams cannot be downloaded. 📺 Please share a link to a posted video instead!"
+                )
+            if not is_single_post:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This link is not downloadable. Please share a link to a specific video — not a profile, hashtag, or sound page."
+                )
+
         # --- PINTEREST: try yt-dlp, fallback later ---
         if "pinterest.com" in url_lower or "pin.it" in url_lower:
             pass  # Falls through to yt-dlp below
@@ -693,7 +768,6 @@ def extract_video(
         # before passing them to yt-dlp, bypassing the "Cannot parse data" errors entirely.
         if "facebook.com/share/" in url_lower:
             try:
-                import requests
                 print(f"Facebook share link detected. Attempting to unwrap: {url_decoded}")
                 r = requests.head(url_decoded, allow_redirects=True, timeout=10)
                 url_decoded = r.url
@@ -741,7 +815,46 @@ def extract_video(
                     status_code=403,
                     detail="This content is private or age-restricted."
                 )
-                
+
+            # --- TikTok fast-fail ---
+            # Every fallback below is an Instagram scraper; running them on a
+            # TikTok URL only burns time (and proxy bandwidth) before failing.
+            tiktok_handled = False
+            if is_tiktok_url(url_decoded):
+                tiktok_handled = True
+                lowered = primary_msg.lower()
+                # Match on error phrasing only — a bare "404" would also hit
+                # video IDs that happen to contain those digits.
+                if any(term in lowered for term in ["unable to find video in feed", "video not available", "404: not found", "http error 404", "does not exist", "has been removed"]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This video is unavailable. It may be deleted, private, or restricted in your region. 🚫"
+                    )
+                if any(term in lowered for term in ["ip address is blocked", "geo-restrict", "geo restrict", "not available in your region", "unavailable in your region"]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This video is blocked in our server's region. 🌍"
+                    )
+                # One retry with a clean cache: TikTok's web challenge is flaky
+                # and usually clears on a second pass. Slideshow posts have no
+                # mp4 at all, so those retry without the video-only filter.
+                wants_photo = any(term in lowered for term in ["no video", "no formats", "playlist", "expecting value", "extra data"])
+                try:
+                    clear_ytdlp_cache()
+                    if wants_photo:
+                        info = extract_media_generic(url_decoded, use_cookies=False)
+                    else:
+                        info = extract_with_ytdlp(url_decoded, use_cookies=False)
+                except Exception as tiktok_retry_error:
+                    print(f"TikTok retry failed: {tiktok_retry_error}")
+                    info = None
+                if not info:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Could not read this video. Please make sure the link is public and try again."
+                    )
+
+            
             # Check for Facebook video format that yt-dlp cannot currently parse
             # This happens with old-style Facebook /videos/ posts (not Reels)
             if "cannot parse data" in primary_msg.lower() and any(fb in url_decoded.lower() for fb in ["facebook.com", "fb.watch", "fb.gg"]):
@@ -765,7 +878,7 @@ def extract_video(
                 is_photo_fallback = True
             
             # If not explicitly a photo fallback, try video fallback first
-            if not is_photo_fallback:
+            if not is_photo_fallback and not tiktok_handled:
                 try:
                     clear_ytdlp_cache()
                     info = fallback_instagram_scrape(url_decoded, use_cookies=True)
@@ -790,7 +903,7 @@ def extract_video(
                     is_photo_fallback = True
             
             # If we determined we need photo/generic extraction
-            if is_photo_fallback:
+            if is_photo_fallback and not tiktok_handled:
                 if "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower():
                     # Fail fast for Pinterest instead of wasting 30 seconds on generic extractors
                     error_str = primary_msg.lower()
@@ -900,7 +1013,30 @@ def extract_video(
             "media_type": media_type,
             "media_urls": media_urls
         }
-        
+
+        # TikTok CDN links are only served to the session that requested them,
+        # so the client has to replay these headers or it gets HTTP 403.
+        # Prefer a clean 400 over a 200 that always fails on download.
+        if is_tiktok_url(url_decoded):
+            cookie_header = (info.get("_download_cookie") or "").strip()
+            if not cookie_header:
+                print(
+                    "TikTok extract succeeded but session cookies were empty — "
+                    "refusing to return undownloadable CDN URL"
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Could not prepare this video for download. Please try again in a moment."
+                )
+            download_headers = {
+                "Referer": "https://www.tiktok.com/",
+                "Cookie": cookie_header,
+            }
+            user_agent = info.get("_download_user_agent")
+            if user_agent:
+                download_headers["User-Agent"] = user_agent
+            response_data["download_headers"] = download_headers
+
         return response_data
         
     except HTTPException as he:
