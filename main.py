@@ -15,6 +15,11 @@ import re
 import gc
 import random
 import asyncio
+import threading
+
+# Hot-reloaded Instagram cookies from ig_cookie_bot (survives until process restart).
+_RUNTIME_IG_COOKIES = None
+_RUNTIME_IG_COOKIES_LOCK = threading.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -22,6 +27,26 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(title="LoopHole Backend", version="1.0.0", lifespan=lifespan)
+
+
+def get_effective_ig_cookies():
+    """Prefer bot hot-reload cookies, then IG_COOKIES env."""
+    with _RUNTIME_IG_COOKIES_LOCK:
+        if _RUNTIME_IG_COOKIES and _RUNTIME_IG_COOKIES.strip():
+            return _RUNTIME_IG_COOKIES.strip()
+    env_cookies = os.environ.get("IG_COOKIES")
+    if env_cookies and env_cookies.strip():
+        return env_cookies.strip()
+    return None
+
+
+def set_runtime_ig_cookies(cookie_content: str) -> None:
+    global _RUNTIME_IG_COOKIES
+    content = (cookie_content or "").strip()
+    if content and not content.startswith("# Netscape HTTP Cookie File"):
+        content = "# Netscape HTTP Cookie File\n" + content
+    with _RUNTIME_IG_COOKIES_LOCK:
+        _RUNTIME_IG_COOKIES = content
 
 # Enable CORS for the Flutter client
 app.add_middleware(
@@ -70,6 +95,52 @@ def clear_cache_endpoint(request: Request):
         return {"status": "success", "message": "Backend cache cleared successfully"}
     else:
         raise HTTPException(status_code=500, detail="Failed to clear yt-dlp cache")
+
+
+@app.post("/admin/ig-cookies")
+async def admin_set_ig_cookies(request: Request):
+    """
+    Hot-reload Instagram Netscape cookies from the cookie bot.
+    Does not require a Render redeploy for the running instance.
+    """
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    cookies = (body or {}).get("cookies", "")
+    if not cookies or not str(cookies).strip():
+        raise HTTPException(status_code=400, detail="Missing cookies")
+
+    cookie_text = str(cookies).strip()
+    if "sessionid" not in cookie_text:
+        raise HTTPException(status_code=400, detail="Cookies must include sessionid")
+
+    set_runtime_ig_cookies(cookie_text)
+    clear_ytdlp_cache()
+    print("[admin] Runtime IG_COOKIES hot-reloaded by cookie bot")
+    return {"status": "success", "message": "IG cookies hot-reloaded", "has_sessionid": True}
+
+
+@app.get("/admin/ig-cookies/status")
+def admin_ig_cookies_status(request: Request):
+    x_api_key = request.headers.get("x-api-key", "")
+    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+
+    with _RUNTIME_IG_COOKIES_LOCK:
+        runtime_set = bool(_RUNTIME_IG_COOKIES and _RUNTIME_IG_COOKIES.strip())
+    env_set = bool(os.environ.get("IG_COOKIES", "").strip())
+    effective = get_effective_ig_cookies() or ""
+    return {
+        "runtime_set": runtime_set,
+        "env_set": env_set,
+        "has_sessionid": "sessionid" in effective,
+    }
 
 async def auto_update_ytdlp():
     """
@@ -247,9 +318,9 @@ def get_writable_cookies_path(url: str = "") -> str:
     import uuid
     unique_id = uuid.uuid4().hex
     
-    # 1. Check if 'IG_COOKIES' environment variable is provided, ONLY for Instagram
+    # 1. Runtime hot-reload / IG_COOKIES env — Instagram only
     if "instagram.com" in url_lower:
-        ig_cookies = os.environ.get("IG_COOKIES")
+        ig_cookies = get_effective_ig_cookies()
         if ig_cookies:
             try:
                 temp_dir = tempfile.gettempdir()
