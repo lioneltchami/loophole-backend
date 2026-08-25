@@ -85,6 +85,14 @@ def log(msg: str) -> None:
     print(f"[ig-cookie-bot] {msg}", flush=True)
 
 
+
+def _clean_cred(value: str) -> str:
+    """Strip Excel/CSV quoting artifacts from username/password cells."""
+    s = (value or "").strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1]
+    return s.lstrip("'\"").strip()
+
 def load_ig_accounts():
     """
     Load dummy IG accounts for Playwright relogin rotation.
@@ -99,14 +107,14 @@ def load_ig_accounts():
                 for item in raw:
                     if not isinstance(item, dict):
                         continue
-                    user = (item.get("username") or item.get("user") or "").strip()
-                    password = (item.get("password") or item.get("pass") or "").strip()
+                    user = _clean_cred(item.get("username") or item.get("user") or "")
+                    password = _clean_cred(item.get("password") or item.get("pass") or "")
                     if user and password:
                         accounts.append({"username": user, "password": password})
         except json.JSONDecodeError as e:
             log(f"IG_ACCOUNTS_JSON parse error: {e}")
     if not accounts and IG_USERNAME and IG_PASSWORD:
-        accounts.append({"username": IG_USERNAME, "password": IG_PASSWORD})
+        accounts.append({"username": _clean_cred(IG_USERNAME), "password": _clean_cred(IG_PASSWORD)})
     return accounts
 
 
