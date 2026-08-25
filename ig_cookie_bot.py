@@ -11,6 +11,7 @@ LoopHole Instagram cookie refresh bot (hardened).
 from __future__ import annotations
 
 import html
+import json
 import os
 import sys
 import time
@@ -63,6 +64,7 @@ PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 IG_COOKIES = os.environ.get("IG_COOKIES", "").strip()
 IG_USERNAME = os.environ.get("IG_USERNAME", "").strip()
 IG_PASSWORD = os.environ.get("IG_PASSWORD", "").strip()
+IG_ACCOUNTS_JSON = os.environ.get("IG_ACCOUNTS_JSON", "").strip()
 IG_USER_AGENT = os.environ.get(
     "IG_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -81,6 +83,31 @@ CLIENT_API_KEY = os.environ.get("LOOPHOLE_API_KEY", "LOOPHOLE_SECURE_V1_TOKEN").
 
 def log(msg: str) -> None:
     print(f"[ig-cookie-bot] {msg}", flush=True)
+
+
+def load_ig_accounts():
+    """
+    Load dummy IG accounts for Playwright relogin rotation.
+    Prefers IG_ACCOUNTS_JSON=[{"username":"...","password":"..."}, ...]
+    Falls back to single IG_USERNAME / IG_PASSWORD.
+    """
+    accounts = []
+    if IG_ACCOUNTS_JSON:
+        try:
+            raw = json.loads(IG_ACCOUNTS_JSON)
+            if isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    user = (item.get("username") or item.get("user") or "").strip()
+                    password = (item.get("password") or item.get("pass") or "").strip()
+                    if user and password:
+                        accounts.append({"username": user, "password": password})
+        except json.JSONDecodeError as e:
+            log(f"IG_ACCOUNTS_JSON parse error: {e}")
+    if not accounts and IG_USERNAME and IG_PASSWORD:
+        accounts.append({"username": IG_USERNAME, "password": IG_PASSWORD})
+    return accounts
 
 
 def send_telegram(message: str) -> None:
@@ -417,10 +444,12 @@ def keep_alive_with_curl(seed_cookies: str) -> tuple[str, str]:
     return netscape, f"keep-alive status={last_status}"
 
 
-def relogin_with_playwright() -> tuple[Optional[str], str]:
-    """Best-effort IG login. Returns (netscape_or_none, detail)."""
-    if not IG_USERNAME or not IG_PASSWORD:
-        return None, "IG_USERNAME/IG_PASSWORD not set"
+def relogin_with_playwright(
+    username: str, password: str
+) -> tuple[Optional[str], str]:
+    """Best-effort IG login for one account. Returns (netscape_or_none, detail)."""
+    if not username or not password:
+        return None, "username/password missing"
 
     try:
         from playwright.sync_api import sync_playwright
@@ -428,6 +457,7 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
         return None, "playwright not installed"
 
     proxy = parse_proxy(PROXY_URL)
+    user_hint = username[:3] + "***"
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -461,8 +491,8 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
             user_sel = 'input[name="username"]'
             pass_sel = 'input[name="password"]'
             page.wait_for_selector(user_sel, timeout=30000)
-            page.fill(user_sel, IG_USERNAME)
-            page.fill(pass_sel, IG_PASSWORD)
+            page.fill(user_sel, username)
+            page.fill(pass_sel, password)
             page.get_by_role("button", name="Log in").click()
             time.sleep(8)
 
@@ -507,11 +537,37 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
             )
 
         if not has_session:
-            return None, "Playwright login finished but sessionid missing (checkpoint/2FA/captcha?)"
+            return None, f"Playwright login ({user_hint}) missing sessionid (checkpoint/2FA/captcha?)"
 
-        return "\n".join(lines) + "\n", "playwright login ok"
+        return "\n".join(lines) + "\n", f"playwright login ok ({user_hint})"
     except Exception as e:
-        return None, f"playwright login failed: {e}"
+        return None, f"playwright login failed ({user_hint}): {e}"
+
+
+def try_relogin_rotate() -> tuple[Optional[str], str, str]:
+    """
+    Try each configured IG account until one yields a live session.
+    Returns (netscape_or_none, detail, source_label).
+    """
+    accounts = load_ig_accounts()
+    if not accounts:
+        return None, "no IG accounts configured (IG_ACCOUNTS_JSON / IG_USERNAME)", ""
+
+    log(f"Playwright rotation: {len(accounts)} account(s)")
+    last_detail = "no attempts"
+    for idx, acct in enumerate(accounts, 1):
+        user = acct["username"]
+        log(f"Trying account {idx}/{len(accounts)} ({user[:3]}***)")
+        fresh, detail = relogin_with_playwright(user, acct["password"])
+        log(detail)
+        last_detail = detail
+        if not fresh:
+            continue
+        alive, alive_detail = probe_session_alive(fresh)
+        log(f"Post-login liveness ({user[:3]}***): {alive_detail}")
+        if alive:
+            return fresh, alive_detail, f"playwright-login:{user[:3]}***"
+    return None, last_detail, ""
 
 
 def hot_reload_backend(netscape: str) -> bool:
@@ -574,58 +630,57 @@ def main() -> int:
         )
         return 3
 
-    seed, seed_source = resolve_seed()
-    if not seed:
-        send_telegram(
-            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
-            "No usable IG cookie seed (backend/Render/Actions all empty).\n"
-            "Paste fresh Netscape cookies into Render <code>IG_COOKIES</code> "
-            "and the Actions secret once."
-        )
-        return 2
+    accounts = load_ig_accounts()
+    log(f"Configured IG login accounts: {len(accounts)}")
 
-    log(f"Using seed from: {seed_source}")
+    seed, seed_source = resolve_seed()
     netscape = seed
     source = seed_source
+    alive = False
+    alive_detail = "no seed"
 
-    # Keep-alive only if seed is not already proven alive
-    alive, alive_detail = probe_session_alive(netscape)
-    log(f"Initial liveness: {alive_detail}")
+    if seed:
+        log(f"Using seed from: {seed_source}")
+        alive, alive_detail = probe_session_alive(netscape)
+        log(f"Initial liveness: {alive_detail}")
+
+        if not alive:
+            try:
+                warmed, detail = keep_alive_with_curl(seed)
+                log(detail)
+                alive, alive_detail = probe_session_alive(warmed)
+                log(f"Post keep-alive liveness: {alive_detail}")
+                if alive:
+                    netscape = warmed
+                    source = "keep-alive"
+                else:
+                    netscape = warmed
+            except Exception as e:
+                log(f"Keep-alive crashed: {e}")
+                traceback.print_exc()
+    else:
+        log("No cookie seed — will rely on Playwright account rotation")
 
     if not alive:
-        try:
-            warmed, detail = keep_alive_with_curl(seed)
-            log(detail)
-            alive, alive_detail = probe_session_alive(warmed)
-            log(f"Post keep-alive liveness: {alive_detail}")
-            if alive:
-                netscape = warmed
-                source = "keep-alive"
-            else:
-                netscape = warmed
-        except Exception as e:
-            log(f"Keep-alive crashed: {e}")
-            traceback.print_exc()
-
-    if not alive:
-        log("Session dead — attempting Playwright relogin")
-        fresh, detail = relogin_with_playwright()
-        log(detail)
+        log("Session dead/missing — attempting Playwright account rotation")
+        fresh, detail, login_source = try_relogin_rotate()
         if fresh:
-            alive, alive_detail = probe_session_alive(fresh)
-            log(f"Post-login liveness: {alive_detail}")
-            if alive:
-                netscape = fresh
-                source = "playwright-login"
+            netscape = fresh
+            alive = True
+            alive_detail = detail
+            source = login_source or "playwright-login"
+        else:
+            alive_detail = detail
 
     if not alive:
         safe_detail = html.escape((alive_detail or "unknown")[:240])
         send_telegram(
             "🚨 <b>LoopHole Cookie Bot</b>\n\n"
-            "Instagram session is dead after keep-alive/login.\n"
-            f"<b>Detail:</b> <code>{safe_detail}</code>\n\n"
+            "Instagram session is dead after keep-alive/login rotation.\n"
+            f"<b>Detail:</b> <code>{safe_detail}</code>\n"
+            f"<b>Accounts tried:</b> {len(accounts)}\n\n"
             "Action: export fresh Netscape cookies from a dummy IG account "
-            "and update Render <code>IG_COOKIES</code> (Actions secret optional after first live seed)."
+            "in real Chrome, or fix checkpoint on one of the dummy accounts."
         )
         return 2
 
