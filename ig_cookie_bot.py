@@ -567,7 +567,7 @@ def main() -> int:
     if not PROXY_URL:
         log("WARNING: PROXY_URL empty — IG may block datacenter IP")
     if not ADMIN_KEY:
-        log("ERROR: COOKIE_BOT_ADMIN_KEY (or LOOPHOLE_API_KEY fallback) required")
+        log("ERROR: COOKIE_BOT_ADMIN_KEY required")
         send_telegram(
             "🚨 <b>LoopHole Cookie Bot</b>\n\n"
             "Missing <code>COOKIE_BOT_ADMIN_KEY</code>. Refusing to run."
