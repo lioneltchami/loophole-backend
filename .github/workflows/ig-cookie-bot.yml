@@ -1,0 +1,37 @@
+name: IG Cookie Bot
+
+on:
+  schedule:
+    # Every 12 hours
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps + Chromium
+        run: |
+          pip install -r requirements-cookie-bot.txt
+          playwright install --with-deps chromium
+
+      - name: Refresh Instagram cookies
+        env:
+          PROXY_URL: ${{ secrets.PROXY_URL }}
+          IG_COOKIES: ${{ secrets.IG_COOKIES }}
+          IG_USERNAME: ${{ secrets.IG_USERNAME }}
+          IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LOOPHOLE_API_KEY: ${{ secrets.LOOPHOLE_API_KEY }}
+        run: python ig_cookie_bot.py
