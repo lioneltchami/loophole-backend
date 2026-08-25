@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-LoopHole Instagram cookie refresh bot.
+LoopHole Instagram cookie refresh bot (hardened).
 
-1) Keep-alive: warm an existing IG session via curl_cffi + proxy, harvest cookies.
-2) Relogin (optional): if session is dead and IG_USERNAME/IG_PASSWORD are set, try Playwright.
-3) Push: hot-reload live backend, then persist IG_COOKIES on the web service via Render API.
-
-Intended to run as a Render Cron Job every 12h.
+1) Seed from live backend (preferred) or Render env, then Actions/env seed as fallback.
+2) Keep-alive via curl_cffi + proxy; prove liveness (not just sessionid presence).
+3) Optional Playwright relogin if dead and credentials set.
+4) Hot-reload live backend (required for success); persist IG_COOKIES on Render (best-effort).
 """
 
 from __future__ import annotations
 
+import html
 import os
 import sys
 import time
@@ -57,7 +57,7 @@ def make_cookie(
     )
 
 
-API_KEY = os.environ.get("LOOPHOLE_API_KEY", "LOOPHOLE_SECURE_V1_TOKEN")
+ADMIN_KEY = os.environ.get("COOKIE_BOT_ADMIN_KEY", "").strip()
 BACKEND_URL = os.environ.get("BACKEND_URL", "https://loophole-backend-1xo4.onrender.com").rstrip("/")
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 IG_COOKIES = os.environ.get("IG_COOKIES", "").strip()
@@ -75,6 +75,8 @@ RENDER_WEB_SERVICE_ID = os.environ.get(
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 DRY_RUN = os.environ.get("COOKIE_BOT_DRY_RUN", "").lower() in ("1", "true", "yes")
+SMOKE_EXTRACT_URL = os.environ.get("COOKIE_BOT_SMOKE_URL", "").strip()
+CLIENT_API_KEY = os.environ.get("LOOPHOLE_API_KEY", "LOOPHOLE_SECURE_V1_TOKEN").strip()
 
 
 def log(msg: str) -> None:
@@ -148,36 +150,46 @@ def parse_proxy(proxy_url: str) -> Optional[dict]:
     return out
 
 
-def session_looks_logged_in(netscape: str) -> bool:
-    for line in netscape.splitlines():
-        if line.startswith("#") or not line.strip():
+def extract_sessionid(netscape: str) -> Optional[str]:
+    """Return sessionid cookie value from Netscape text, or None."""
+    for raw in (netscape or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_") :]
+        elif line.startswith("#"):
             continue
         parts = line.split("\t")
         if len(parts) < 7:
             continue
         name, value = parts[5], parts[6]
-        if name == "sessionid" and value and value not in ("0", "deleted"):
-            return True
-    return False
+        if name != "sessionid":
+            continue
+        value = (value or "").strip()
+        if not value or value in ("0", "deleted", "null"):
+            return None
+        return value
+    return None
 
 
-def keep_alive_with_curl(seed_cookies: str) -> tuple[str, bool, str]:
-    """
-    Warm Instagram with existing cookies. Returns (netscape, logged_in, detail).
-    """
-    if cffi_requests is None:
-        return seed_cookies, session_looks_logged_in(seed_cookies), "curl_cffi missing"
+def session_has_sessionid(netscape: str) -> bool:
+    return extract_sessionid(netscape) is not None
 
+
+def load_jar_from_netscape(seed_cookies: str) -> MozillaCookieJar:
     cookie_path = "/tmp/ig_bot_seed_cookies.txt"
     write_temp_netscape(seed_cookies, cookie_path)
-
     jar = MozillaCookieJar(cookie_path)
     jar.load(ignore_discard=True, ignore_expires=True)
+    return jar
 
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+
+def build_cffi_session(seed_cookies: str):
+    if cffi_requests is None:
+        raise RuntimeError("curl_cffi missing")
+    jar = load_jar_from_netscape(seed_cookies)
     session = cffi_requests.Session(impersonate="chrome124")
-
-    # Load jar into session
     for c in jar:
         session.cookies.set(
             c.name,
@@ -185,6 +197,180 @@ def keep_alive_with_curl(seed_cookies: str) -> tuple[str, bool, str]:
             domain=c.domain,
             path=c.path or "/",
         )
+    return session, jar
+
+
+def probe_session_alive(netscape: str) -> tuple[bool, str]:
+    """
+    Prove the session is actually authenticated against Instagram.
+    sessionid presence alone is not enough.
+    """
+    if not session_has_sessionid(netscape):
+        return False, "no sessionid cookie"
+
+    if cffi_requests is None:
+        return False, "curl_cffi missing for liveness probe"
+
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    headers = {
+        "User-Agent": IG_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    try:
+        session, _jar = build_cffi_session(netscape)
+        resp = session.get(
+            "https://www.instagram.com/accounts/edit/",
+            headers=headers,
+            proxies=proxies,
+            timeout=45,
+            allow_redirects=True,
+        )
+        final_url = str(getattr(resp, "url", "") or "")
+        body = (resp.text or "")[:8000].lower()
+        status = resp.status_code
+        log(f"Liveness probe accounts/edit -> {status} url={final_url[:80]}")
+
+        if status in (401, 403):
+            return False, f"probe HTTP {status}"
+        if "/accounts/login" in final_url:
+            return False, "redirected to login"
+        if "loginform" in body or '"login_page"' in body:
+            return False, "login page HTML"
+        # Logged-in edit page usually exposes email/username fields or settings chrome
+        positive = any(
+            marker in body
+            for marker in (
+                "password",
+                "email",
+                "username",
+                "accounts/edit",
+                "settings",
+            )
+        )
+        if status == 200 and positive and "create an account" not in body:
+            return True, f"probe ok status={status}"
+        if status == 200 and session_has_sessionid(netscape) and "/accounts/login" not in final_url:
+            # Soft accept: 200 on edit without login redirect
+            return True, f"probe soft-ok status={status}"
+        return False, f"probe inconclusive status={status}"
+    except Exception as e:
+        return False, f"probe error: {e}"
+
+
+def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
+    """Optional: push cookies temporarily and hit /extract on a known public Reel."""
+    if not SMOKE_EXTRACT_URL:
+        return True, "smoke skipped (COOKIE_BOT_SMOKE_URL unset)"
+    if DRY_RUN:
+        return True, "smoke skipped (dry run)"
+    if not hot_reload_backend(netscape):
+        return False, "smoke aborted: hot-reload failed before extract"
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/extract",
+            params={"url": SMOKE_EXTRACT_URL},
+            headers={"x-api-key": CLIENT_API_KEY},
+            timeout=60,
+        )
+        ok = resp.status_code == 200
+        return ok, f"smoke extract -> {resp.status_code}"
+    except Exception as e:
+        return False, f"smoke extract error: {e}"
+
+
+def fetch_live_cookies_from_backend() -> tuple[str, str]:
+    if not ADMIN_KEY:
+        return "", "no COOKIE_BOT_ADMIN_KEY"
+    try:
+        resp = requests.get(
+            f"{BACKEND_URL}/admin/ig-cookies",
+            headers={"x-api-key": ADMIN_KEY},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return "", f"backend export HTTP {resp.status_code}"
+        data = resp.json()
+        cookies = ensure_netscape_header((data or {}).get("cookies") or "")
+        if session_has_sessionid(cookies):
+            return cookies, "backend live export"
+        return "", "backend export missing sessionid"
+    except Exception as e:
+        return "", f"backend export error: {e}"
+
+
+def fetch_live_cookies_from_render() -> tuple[str, str]:
+    if not RENDER_API_KEY:
+        return "", "no RENDER_API_KEY"
+    try:
+        resp = requests.get(
+            f"https://api.render.com/v1/services/{RENDER_WEB_SERVICE_ID}/env-vars/IG_COOKIES",
+            headers={
+                "Authorization": f"Bearer {RENDER_API_KEY}",
+                "Accept": "application/json",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            return "", f"render GET IG_COOKIES HTTP {resp.status_code}"
+        data = resp.json()
+        # Render may return {key,value} or envVar wrapper
+        value = ""
+        if isinstance(data, dict):
+            value = data.get("value") or (data.get("envVar") or {}).get("value") or ""
+        cookies = ensure_netscape_header(value or "")
+        if session_has_sessionid(cookies):
+            return cookies, "render env IG_COOKIES"
+        return "", "render IG_COOKIES missing sessionid"
+    except Exception as e:
+        return "", f"render export error: {e}"
+
+
+def resolve_seed() -> tuple[str, str]:
+    """
+    Prefer live backend cookies, then Render env, then Actions/local IG_COOKIES.
+    Avoids stale GitHub secret overwriting a healthy live session.
+    """
+    candidates = []
+
+    live_be, detail_be = fetch_live_cookies_from_backend()
+    log(f"Seed candidate backend: {detail_be}")
+    if live_be:
+        candidates.append((live_be, detail_be))
+
+    live_render, detail_render = fetch_live_cookies_from_render()
+    log(f"Seed candidate render: {detail_render}")
+    if live_render:
+        candidates.append((live_render, detail_render))
+
+    seed_env = ensure_netscape_header(IG_COOKIES)
+    if session_has_sessionid(seed_env):
+        candidates.append((seed_env, "env/Actions IG_COOKIES"))
+    elif seed_env:
+        log("env/Actions IG_COOKIES present but no valid sessionid")
+
+    if not candidates:
+        return "", "no seed available"
+
+    # Prefer a candidate that already passes liveness
+    for cookies, source in candidates:
+        alive, detail = probe_session_alive(cookies)
+        log(f"Seed probe [{source}]: {detail}")
+        if alive:
+            return cookies, source
+
+    # Fall back to first candidate (will try keep-alive / relogin)
+    return candidates[0][0], candidates[0][1]
+
+
+def keep_alive_with_curl(seed_cookies: str) -> tuple[str, str]:
+    """Warm Instagram with existing cookies. Returns (netscape, detail)."""
+    if cffi_requests is None:
+        return seed_cookies, "curl_cffi missing"
+
+    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+    session, jar = build_cffi_session(seed_cookies)
 
     headers = {
         "User-Agent": IG_USER_AGENT,
@@ -199,14 +385,15 @@ def keep_alive_with_curl(seed_cookies: str) -> tuple[str, bool, str]:
     last_status = None
     for url in urls:
         try:
-            resp = session.get(url, headers=headers, proxies=proxies, timeout=45, allow_redirects=True)
+            resp = session.get(
+                url, headers=headers, proxies=proxies, timeout=45, allow_redirects=True
+            )
             last_status = resp.status_code
             log(f"Keep-alive GET {url} -> {resp.status_code}")
             time.sleep(1.5)
         except Exception as e:
             log(f"Keep-alive request failed for {url}: {e}")
 
-    # Merge session cookies back into Mozilla jar
     try:
         for c in session.cookies:
             domain = getattr(c, "domain", None) or ".instagram.com"
@@ -226,10 +413,8 @@ def keep_alive_with_curl(seed_cookies: str) -> tuple[str, bool, str]:
     except Exception as e:
         log(f"Cookie merge warning: {e}")
 
-    netscape = jar_to_netscape(jar)
-    logged_in = session_looks_logged_in(netscape)
-    detail = f"keep-alive status={last_status} logged_in={logged_in}"
-    return ensure_netscape_header(netscape), logged_in, detail
+    netscape = ensure_netscape_header(jar_to_netscape(jar))
+    return netscape, f"keep-alive status={last_status}"
 
 
 def relogin_with_playwright() -> tuple[Optional[str], str]:
@@ -255,11 +440,18 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
                 proxy=proxy,
             )
             page = context.new_page()
-            page.goto("https://www.instagram.com/accounts/login/", wait_until="domcontentloaded", timeout=60000)
+            page.goto(
+                "https://www.instagram.com/accounts/login/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
             time.sleep(3)
 
-            # Cookie / consent banners — best effort dismiss
-            for label in ("Allow all cookies", "Accept", "Allow essential and optional cookies"):
+            for label in (
+                "Allow all cookies",
+                "Accept",
+                "Allow essential and optional cookies",
+            ):
                 try:
                     page.get_by_role("button", name=label).click(timeout=2000)
                     time.sleep(1)
@@ -274,7 +466,6 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
             page.get_by_role("button", name="Log in").click()
             time.sleep(8)
 
-            # Dismiss post-login prompts
             for text in ("Not Now", "Not now", "Save info"):
                 try:
                     page.get_by_role("button", name=text).click(timeout=3000)
@@ -282,13 +473,16 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
                 except Exception:
                     pass
 
-            page.goto("https://www.instagram.com/", wait_until="domcontentloaded", timeout=60000)
+            page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=60000,
+            )
             time.sleep(3)
 
             cookies = context.cookies()
             browser.close()
 
-        # Build Netscape from Playwright cookies
         lines = ["# Netscape HTTP Cookie File", "# LoopHole Playwright login export", ""]
         has_session = False
         for c in cookies:
@@ -298,10 +492,15 @@ def relogin_with_playwright() -> tuple[Optional[str], str]:
             include_sub = "TRUE" if domain.startswith(".") else "FALSE"
             path = c.get("path") or "/"
             secure = "TRUE" if c.get("secure") else "FALSE"
-            expires = str(int(c.get("expires") or 0))
+            raw_expires = c.get("expires")
+            # Playwright uses -1 for session cookies; Netscape wants 0
+            if raw_expires is None or float(raw_expires) < 0:
+                expires = "0"
+            else:
+                expires = str(int(float(raw_expires)))
             name = c.get("name") or ""
             value = c.get("value") or ""
-            if name == "sessionid" and value:
+            if name == "sessionid" and value and value not in ("0", "deleted"):
                 has_session = True
             lines.append(
                 "\t".join([domain, include_sub, path, secure, expires, name, value])
@@ -319,10 +518,13 @@ def hot_reload_backend(netscape: str) -> bool:
     if DRY_RUN:
         log("DRY_RUN: skip hot-reload")
         return True
+    if not ADMIN_KEY:
+        log("COOKIE_BOT_ADMIN_KEY missing; cannot hot-reload")
+        return False
     try:
         resp = requests.post(
             f"{BACKEND_URL}/admin/ig-cookies",
-            headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+            headers={"x-api-key": ADMIN_KEY, "Content-Type": "application/json"},
             json={"cookies": netscape},
             timeout=30,
         )
@@ -361,59 +563,102 @@ def persist_to_render(netscape: str) -> bool:
 
 
 def main() -> int:
-    log("Starting Instagram cookie refresh")
+    log("Starting Instagram cookie refresh (hardened)")
     if not PROXY_URL:
         log("WARNING: PROXY_URL empty — IG may block datacenter IP")
+    if not ADMIN_KEY:
+        log("ERROR: COOKIE_BOT_ADMIN_KEY (or LOOPHOLE_API_KEY fallback) required")
+        send_telegram(
+            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
+            "Missing <code>COOKIE_BOT_ADMIN_KEY</code>. Refusing to run."
+        )
+        return 3
 
-    seed = ensure_netscape_header(IG_COOKIES)
+    seed, seed_source = resolve_seed()
+    if not seed:
+        send_telegram(
+            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
+            "No usable IG cookie seed (backend/Render/Actions all empty).\n"
+            "Paste fresh Netscape cookies into Render <code>IG_COOKIES</code> "
+            "and the Actions secret once."
+        )
+        return 2
+
+    log(f"Using seed from: {seed_source}")
     netscape = seed
-    logged_in = session_looks_logged_in(seed)
-    source = "seed"
+    source = seed_source
 
-    if seed:
+    # Keep-alive only if seed is not already proven alive
+    alive, alive_detail = probe_session_alive(netscape)
+    log(f"Initial liveness: {alive_detail}")
+
+    if not alive:
         try:
-            netscape, logged_in, detail = keep_alive_with_curl(seed)
-            source = "keep-alive"
+            warmed, detail = keep_alive_with_curl(seed)
             log(detail)
+            alive, alive_detail = probe_session_alive(warmed)
+            log(f"Post keep-alive liveness: {alive_detail}")
+            if alive:
+                netscape = warmed
+                source = "keep-alive"
+            else:
+                netscape = warmed
         except Exception as e:
             log(f"Keep-alive crashed: {e}")
             traceback.print_exc()
-            logged_in = session_looks_logged_in(seed)
-            netscape = seed
-    else:
-        log("No seed IG_COOKIES in env")
 
-    if not logged_in:
+    if not alive:
         log("Session dead — attempting Playwright relogin")
         fresh, detail = relogin_with_playwright()
         log(detail)
-        if fresh and session_looks_logged_in(fresh):
-            netscape = fresh
-            logged_in = True
-            source = "playwright-login"
-        else:
-            send_telegram(
-                "🚨 <b>LoopHole Cookie Bot</b>\n\n"
-                "Instagram session is dead and auto-login failed.\n"
-                f"<b>Detail:</b> <code>{detail[:240]}</code>\n\n"
-                "Action: export fresh Netscape cookies from a dummy IG account "
-                "and update <code>IG_COOKIES</code> on the web service + cron."
-            )
-            return 2
+        if fresh:
+            alive, alive_detail = probe_session_alive(fresh)
+            log(f"Post-login liveness: {alive_detail}")
+            if alive:
+                netscape = fresh
+                source = "playwright-login"
 
+    if not alive:
+        safe_detail = html.escape((alive_detail or "unknown")[:240])
+        send_telegram(
+            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
+            "Instagram session is dead after keep-alive/login.\n"
+            f"<b>Detail:</b> <code>{safe_detail}</code>\n\n"
+            "Action: export fresh Netscape cookies from a dummy IG account "
+            "and update Render <code>IG_COOKIES</code> (Actions secret optional after first live seed)."
+        )
+        return 2
+
+    # Optional extract smoke (uses hot-reload internally)
+    smoke_ok, smoke_detail = smoke_extract_with_backend(netscape)
+    log(smoke_detail)
+    if SMOKE_EXTRACT_URL and not smoke_ok:
+        send_telegram(
+            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
+            f"Liveness OK but smoke extract failed: <code>{html.escape(smoke_detail[:240])}</code>\n"
+            "Not persisting cookies."
+        )
+        return 2
+
+    # If smoke already hot-reloaded, still ensure final cookies are loaded
     hot_ok = hot_reload_backend(netscape)
     persist_ok = persist_to_render(netscape)
 
     send_telegram(
         "🍪 <b>LoopHole Cookie Bot</b>\n\n"
-        f"<b>Source:</b> {source}\n"
-        f"<b>Hot-reload:</b> {'ok' if hot_ok else 'fail'}\n"
-        f"<b>Render persist:</b> {'ok' if persist_ok else 'fail/skip'}\n"
-        f"<b>sessionid:</b> present"
+        f"<b>Source:</b> {html.escape(source)}\n"
+        f"<b>Liveness:</b> {html.escape(alive_detail[:120])}\n"
+        f"<b>Smoke:</b> {html.escape(smoke_detail[:120])}\n"
+        f"<b>Hot-reload:</b> {'ok' if hot_ok else 'FAIL'}\n"
+        f"<b>Render persist:</b> {'ok' if persist_ok else 'fail/skip'}"
     )
 
-    if not hot_ok and not persist_ok:
+    # Hot-reload is required for the live process; persist alone is not success.
+    if not hot_ok:
+        log("FAIL: hot-reload required but failed")
         return 1
+    if not persist_ok:
+        log("WARN: live hot-reload OK but Render persist failed (cold start may lose cookies)")
     log("Done")
     return 0
 

@@ -25,13 +25,16 @@ jobs:
       - name: Refresh Instagram cookies
         env:
           PROXY_URL: ${{ secrets.PROXY_URL }}
+          # Bootstrap only — bot prefers live backend/Render cookies when available
           IG_COOKIES: ${{ secrets.IG_COOKIES }}
           IG_USERNAME: ${{ secrets.IG_USERNAME }}
           IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
           RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
           BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          COOKIE_BOT_ADMIN_KEY: ${{ secrets.COOKIE_BOT_ADMIN_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           LOOPHOLE_API_KEY: ${{ secrets.LOOPHOLE_API_KEY }}
+          COOKIE_BOT_SMOKE_URL: ${{ secrets.COOKIE_BOT_SMOKE_URL }}
         run: python ig_cookie_bot.py

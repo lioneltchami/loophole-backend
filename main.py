@@ -29,6 +29,45 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LoopHole Backend", version="1.0.0", lifespan=lifespan)
 
 
+def parse_netscape_sessionid(cookie_text: str):
+    """Return sessionid value from Netscape cookie text, or None."""
+    for raw in (cookie_text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        name, value = parts[5], parts[6]
+        if name != "sessionid":
+            continue
+        value = (value or "").strip()
+        if not value or value in ("0", "deleted", "null"):
+            return None
+        return value
+    return None
+
+
+def require_cookie_bot_admin(request: Request) -> None:
+    """
+    Cookie admin endpoints require COOKIE_BOT_ADMIN_KEY.
+    Intentionally NOT the mobile client API key.
+    """
+    expected = (os.environ.get("COOKIE_BOT_ADMIN_KEY") or "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="COOKIE_BOT_ADMIN_KEY is not configured on this service",
+        )
+    provided = (request.headers.get("x-api-key") or "").strip()
+    if provided != expected:
+        raise HTTPException(status_code=403, detail="Unauthorized cookie-bot admin key")
+
+
 def get_effective_ig_cookies():
     """Prefer bot hot-reload cookies, then IG_COOKIES env."""
     with _RUNTIME_IG_COOKIES_LOCK:
@@ -102,10 +141,9 @@ async def admin_set_ig_cookies(request: Request):
     """
     Hot-reload Instagram Netscape cookies from the cookie bot.
     Does not require a Render redeploy for the running instance.
+    Auth: COOKIE_BOT_ADMIN_KEY (not the mobile client key).
     """
-    x_api_key = request.headers.get("x-api-key", "")
-    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
-        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+    require_cookie_bot_admin(request)
 
     try:
         body = await request.json()
@@ -117,29 +155,59 @@ async def admin_set_ig_cookies(request: Request):
         raise HTTPException(status_code=400, detail="Missing cookies")
 
     cookie_text = str(cookies).strip()
-    if "sessionid" not in cookie_text:
-        raise HTTPException(status_code=400, detail="Cookies must include sessionid")
+    sessionid = parse_netscape_sessionid(cookie_text)
+    if not sessionid:
+        raise HTTPException(
+            status_code=400,
+            detail="Cookies must include a real Netscape sessionid cookie line",
+        )
 
     set_runtime_ig_cookies(cookie_text)
     clear_ytdlp_cache()
     print("[admin] Runtime IG_COOKIES hot-reloaded by cookie bot")
-    return {"status": "success", "message": "IG cookies hot-reloaded", "has_sessionid": True}
+    return {
+        "status": "success",
+        "message": "IG cookies hot-reloaded",
+        "has_sessionid": True,
+        "sessionid_len": len(sessionid),
+    }
+
+
+@app.get("/admin/ig-cookies")
+def admin_get_ig_cookies(request: Request):
+    """Export effective IG cookies so the bot can seed from live state."""
+    require_cookie_bot_admin(request)
+    with _RUNTIME_IG_COOKIES_LOCK:
+        runtime_set = bool(_RUNTIME_IG_COOKIES and _RUNTIME_IG_COOKIES.strip())
+    effective = get_effective_ig_cookies() or ""
+    sessionid = parse_netscape_sessionid(effective)
+    if runtime_set:
+        source = "runtime"
+    elif effective:
+        source = "env"
+    else:
+        source = "none"
+    return {
+        "cookies": effective,
+        "has_sessionid": bool(sessionid),
+        "source": source,
+    }
 
 
 @app.get("/admin/ig-cookies/status")
 def admin_ig_cookies_status(request: Request):
-    x_api_key = request.headers.get("x-api-key", "")
-    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
-        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+    require_cookie_bot_admin(request)
 
     with _RUNTIME_IG_COOKIES_LOCK:
         runtime_set = bool(_RUNTIME_IG_COOKIES and _RUNTIME_IG_COOKIES.strip())
     env_set = bool(os.environ.get("IG_COOKIES", "").strip())
     effective = get_effective_ig_cookies() or ""
+    sessionid = parse_netscape_sessionid(effective)
     return {
         "runtime_set": runtime_set,
         "env_set": env_set,
-        "has_sessionid": "sessionid" in effective,
+        "has_sessionid": bool(sessionid),
+        "sessionid_len": len(sessionid) if sessionid else 0,
     }
 
 async def auto_update_ytdlp():
