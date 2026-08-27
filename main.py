@@ -584,6 +584,87 @@ def send_telegram_alert(message: str):
     # Back-compat alias used by existing call sites.
     send_ops_alert(message)
 
+
+# --- IG extract failure rate alerting (live traffic) ---
+_IG_ALERT_WINDOW_SEC = int(os.environ.get("IG_ALERT_WINDOW_SEC", "600"))
+_IG_ALERT_THRESHOLD = int(os.environ.get("IG_ALERT_THRESHOLD", "3"))
+_IG_ALERT_COOLDOWN_SEC = int(os.environ.get("IG_ALERT_COOLDOWN_SEC", "1800"))
+_ig_failure_times: list[float] = []
+_ig_last_alert_time: float = 0.0
+_IG_ALERT_LOCK = threading.Lock()
+
+_IG_COOKIE_DEATH_PHRASES = (
+    "failed to parse json",
+    "cookies have expired",
+    "empty media response",
+    "instagram blocked the request",
+    "instagram blocked yt-dlp",
+)
+
+_IG_USER_ERROR_EXCLUDES = (
+    "stories cannot be downloaded",
+    "not downloadable",
+    "photos/images, not a video",
+    "please copy a link to a specific video",
+    "login/error link",
+    "pinterest",
+)
+
+
+def _is_downloadable_ig_url(url: str) -> bool:
+    u = (url or "").lower()
+    if "instagram.com" not in u:
+        return False
+    return any(marker in u for marker in ("/p/", "/reel/", "/reels/", "/tv/"))
+
+
+def _is_ig_cookie_death_detail(detail: str) -> bool:
+    d = (detail or "").lower()
+    if any(phrase in d for phrase in _IG_USER_ERROR_EXCLUDES):
+        return False
+    return any(phrase in d for phrase in _IG_COOKIE_DEATH_PHRASES)
+
+
+def record_ig_extract_failure(url: str, status_code: int, detail: str) -> None:
+    """Slack once when IG reel/post extracts fail with cookie-death patterns."""
+    if status_code not in (400, 500):
+        return
+    if not _is_downloadable_ig_url(url):
+        return
+    detail_str = detail if isinstance(detail, str) else str(detail)
+    if not _is_ig_cookie_death_detail(detail_str):
+        return
+
+    now = time.time()
+    global _ig_last_alert_time
+    with _IG_ALERT_LOCK:
+        _ig_failure_times[:] = [
+            t for t in _ig_failure_times if now - t < _IG_ALERT_WINDOW_SEC
+        ]
+        _ig_failure_times.append(now)
+        count = len(_ig_failure_times)
+
+        if count < _IG_ALERT_THRESHOLD:
+            return
+        if now - _ig_last_alert_time < _IG_ALERT_COOLDOWN_SEC:
+            return
+
+        _ig_last_alert_time = now
+        _ig_failure_times.clear()
+
+    server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+    window_min = max(1, _IG_ALERT_WINDOW_SEC // 60)
+    sample = detail_str.replace("\n", " ")[:200]
+    msg = (
+        f":rotating_light: *LoopHole IG extract failures*\n"
+        f"Server: `{server_name}`\n"
+        f"{count} cookie-death failures in {window_min} min "
+        f"(threshold {_IG_ALERT_THRESHOLD})\n"
+        f"Sample: `{sample}`\n"
+        f"Action: refresh IG cookies (cookie bot or `POST /admin/ig-cookies`)"
+    )
+    send_ops_alert(msg)
+
 def fallback_instagram_scrape(url: str, use_cookies: bool = True) -> dict:
     """
     Fallback extractor using browser impersonation with an iPhone Safari User-Agent
@@ -809,6 +890,9 @@ def extract_video(
         _cached = ERROR_CACHE.get(_cache_key)
         if _cached and time.time() < _cached["expiry"]:
             print(f"[ERROR CACHE HIT] Returning cached error for: {_cache_key[-50:]}")
+            record_ig_extract_failure(
+                url_decoded, _cached["status"], _cached.get("detail", "")
+            )
             raise HTTPException(status_code=_cached["status"], detail=_cached["detail"])
         elif _cached:
             del ERROR_CACHE[_cache_key]
@@ -1198,6 +1282,7 @@ def extract_video(
             ERROR_CACHE[_cache_key] = {"status": he.status_code, "detail": he.detail, "expiry": time.time() + ERROR_CACHE_TTL}
         except Exception:
             pass
+        record_ig_extract_failure(url_decoded, he.status_code, he.detail)
         raise he
     except Exception as e:
         error_msg = str(e)
