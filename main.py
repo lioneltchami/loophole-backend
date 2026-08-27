@@ -560,7 +560,9 @@ def send_ops_alert(message: str):
     webhook = (os.environ.get("SLACK_WEBHOOK_URL") or "").strip()
     if webhook:
         try:
-            requests.post(webhook, json={"text": message}, timeout=5)
+            resp = requests.post(webhook, json={"text": message}, timeout=5)
+            if resp.status_code >= 400:
+                print(f"Slack alert failed HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             print(f"Failed to send Slack alert: {e}")
         return
@@ -586,10 +588,18 @@ def send_telegram_alert(message: str):
 
 
 # --- IG extract failure rate alerting (live traffic) ---
-_IG_ALERT_WINDOW_SEC = int(os.environ.get("IG_ALERT_WINDOW_SEC", "600"))
-_IG_ALERT_THRESHOLD = int(os.environ.get("IG_ALERT_THRESHOLD", "3"))
-_IG_ALERT_COOLDOWN_SEC = int(os.environ.get("IG_ALERT_COOLDOWN_SEC", "1800"))
-_ig_failure_times: list[float] = []
+def _safe_int_env(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
+
+
+_IG_ALERT_WINDOW_SEC = _safe_int_env("IG_ALERT_WINDOW_SEC", 600)
+_IG_ALERT_THRESHOLD = _safe_int_env("IG_ALERT_THRESHOLD", 3)
+_IG_ALERT_COOLDOWN_SEC = _safe_int_env("IG_ALERT_COOLDOWN_SEC", 1800)
+_ig_failure_urls: list[tuple[str, float]] = []
 _ig_last_alert_time: float = 0.0
 _IG_ALERT_LOCK = threading.Lock()
 
@@ -598,7 +608,10 @@ _IG_COOKIE_DEATH_PHRASES = (
     "cookies have expired",
     "empty media response",
     "instagram blocked the request",
-    "instagram blocked yt-dlp",
+    "login required",
+    "rate-limit reached",
+    "login_via",
+    "instagram sent an empty media response",
 )
 
 _IG_USER_ERROR_EXCLUDES = (
@@ -607,8 +620,11 @@ _IG_USER_ERROR_EXCLUDES = (
     "photos/images, not a video",
     "please copy a link to a specific video",
     "login/error link",
-    "pinterest",
 )
+
+
+def _normalize_ig_url(url: str) -> str:
+    return (url or "").split("?")[0].rstrip("/").lower()
 
 
 def _is_downloadable_ig_url(url: str) -> bool:
@@ -618,31 +634,36 @@ def _is_downloadable_ig_url(url: str) -> bool:
     return any(marker in u for marker in ("/p/", "/reel/", "/reels/", "/tv/"))
 
 
-def _is_ig_cookie_death_detail(detail: str) -> bool:
-    d = (detail or "").lower()
+def _is_ig_cookie_death_signal(text: str) -> bool:
+    d = (text or "").lower()
     if any(phrase in d for phrase in _IG_USER_ERROR_EXCLUDES):
         return False
     return any(phrase in d for phrase in _IG_COOKIE_DEATH_PHRASES)
 
 
-def record_ig_extract_failure(url: str, status_code: int, detail: str) -> None:
-    """Slack once when IG reel/post extracts fail with cookie-death patterns."""
-    if status_code not in (400, 500):
-        return
+def record_ig_extract_failure(url: str, signal: str) -> None:
+    """Slack once when distinct IG reel/post URLs fail with cookie-death signals."""
     if not _is_downloadable_ig_url(url):
         return
-    detail_str = detail if isinstance(detail, str) else str(detail)
-    if not _is_ig_cookie_death_detail(detail_str):
+    if not _is_ig_cookie_death_signal(signal):
         return
 
+    url_key = _normalize_ig_url(url)
     now = time.time()
     global _ig_last_alert_time
+    count = 0
+    sample = (signal or "").replace("\n", " ")[:200]
     with _IG_ALERT_LOCK:
-        _ig_failure_times[:] = [
-            t for t in _ig_failure_times if now - t < _IG_ALERT_WINDOW_SEC
+        _ig_failure_urls[:] = [
+            (u, t)
+            for u, t in _ig_failure_urls
+            if now - t < _IG_ALERT_WINDOW_SEC
         ]
-        _ig_failure_times.append(now)
-        count = len(_ig_failure_times)
+        seen = {u for u, _ in _ig_failure_urls}
+        if url_key in seen:
+            return
+        _ig_failure_urls.append((url_key, now))
+        count = len(_ig_failure_urls)
 
         if count < _IG_ALERT_THRESHOLD:
             return
@@ -650,15 +671,14 @@ def record_ig_extract_failure(url: str, status_code: int, detail: str) -> None:
             return
 
         _ig_last_alert_time = now
-        _ig_failure_times.clear()
+        _ig_failure_urls.clear()
 
     server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
     window_min = max(1, _IG_ALERT_WINDOW_SEC // 60)
-    sample = detail_str.replace("\n", " ")[:200]
     msg = (
         f":rotating_light: *LoopHole IG extract failures*\n"
         f"Server: `{server_name}`\n"
-        f"{count} cookie-death failures in {window_min} min "
+        f"{count} distinct reel/post URLs failed in {window_min} min "
         f"(threshold {_IG_ALERT_THRESHOLD})\n"
         f"Sample: `{sample}`\n"
         f"Action: refresh IG cookies (cookie bot or `POST /admin/ig-cookies`)"
@@ -890,9 +910,6 @@ def extract_video(
         _cached = ERROR_CACHE.get(_cache_key)
         if _cached and time.time() < _cached["expiry"]:
             print(f"[ERROR CACHE HIT] Returning cached error for: {_cache_key[-50:]}")
-            record_ig_extract_failure(
-                url_decoded, _cached["status"], _cached.get("detail", "")
-            )
             raise HTTPException(status_code=_cached["status"], detail=_cached["detail"])
         elif _cached:
             del ERROR_CACHE[_cache_key]
@@ -1047,6 +1064,8 @@ def extract_video(
             
 
             if is_private:
+                if _is_downloadable_ig_url(url_decoded):
+                    record_ig_extract_failure(url_decoded, primary_msg)
                 raise HTTPException(
                     status_code=403,
                     detail="This content is private or age-restricted."
@@ -1104,6 +1123,8 @@ def extract_video(
             # so we save 2 proxy hits by stopping here immediately.
             # This happens when a reel is private, deleted, or geo-restricted.
             if "empty media response" in primary_msg.lower() and "instagram.com" in url_decoded.lower():
+                if _is_downloadable_ig_url(url_decoded):
+                    record_ig_extract_failure(url_decoded, primary_msg)
                 raise HTTPException(
                     status_code=400,
                     detail="This Instagram post is unavailable. It may be private, deleted, or restricted in your region. 🚫"
@@ -1282,7 +1303,10 @@ def extract_video(
             ERROR_CACHE[_cache_key] = {"status": he.status_code, "detail": he.detail, "expiry": time.time() + ERROR_CACHE_TTL}
         except Exception:
             pass
-        record_ig_extract_failure(url_decoded, he.status_code, he.detail)
+        record_ig_extract_failure(
+            url_decoded,
+            he.detail if isinstance(he.detail, str) else str(he.detail),
+        )
         raise he
     except Exception as e:
         error_msg = str(e)
@@ -1300,6 +1324,8 @@ def extract_video(
         ])
         
         if is_private:
+            if _is_downloadable_ig_url(url_decoded):
+                record_ig_extract_failure(url_decoded, error_msg)
             raise HTTPException(
                 status_code=403, 
                 detail="This content is private or age-restricted."
@@ -1308,6 +1334,7 @@ def extract_video(
         server_name = os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
             
         if "empty media response" in error_msg:
+            record_ig_extract_failure(url_decoded, error_msg)
             alert_msg = (
                 f"🚨 <b>LoopHole Alert</b>\n\n"
                 f"<b>Server:</b> <code>{server_name}</code>\n"
@@ -1338,6 +1365,8 @@ def extract_video(
             send_telegram_alert(alert_msg)
         else:
             # Other general 500 server crashes
+            if _is_downloadable_ig_url(url_decoded):
+                record_ig_extract_failure(url_decoded, error_msg)
             alert_msg = (
                 f"🔥 <b>LoopHole Alert</b>\n\n"
                 f"<b>Server:</b> <code>{server_name}</code>\n"

@@ -6,6 +6,10 @@ on:
     - cron: "0 */12 * * *"
   workflow_dispatch:
 
+concurrency:
+  group: ig-cookie-bot
+  cancel-in-progress: false
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -38,3 +42,12 @@ jobs:
           LOOPHOLE_API_KEY: ${{ secrets.LOOPHOLE_API_KEY }}
           COOKIE_BOT_SMOKE_URL: ${{ secrets.COOKIE_BOT_SMOKE_URL }}
         run: python ig_cookie_bot.py
+
+      - name: Slack alert on workflow failure
+        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          curl -sS -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d '{"text":":x: *IG Cookie Bot workflow failed* — check GitHub Actions logs for loophole-backend."}'

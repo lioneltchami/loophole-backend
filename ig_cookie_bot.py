@@ -59,27 +59,26 @@ def make_cookie(
 
 
 ADMIN_KEY = os.environ.get("COOKIE_BOT_ADMIN_KEY", "").strip()
-BACKEND_URL = os.environ.get("BACKEND_URL", "https://loophole-backend-1xo4.onrender.com").rstrip("/")
+BACKEND_URL = (os.environ.get("BACKEND_URL") or "https://loophole-backend-1xo4.onrender.com").rstrip("/")
 PROXY_URL = os.environ.get("PROXY_URL", "").strip()
 IG_COOKIES = os.environ.get("IG_COOKIES", "").strip()
 IG_USERNAME = os.environ.get("IG_USERNAME", "").strip()
 IG_PASSWORD = os.environ.get("IG_PASSWORD", "").strip()
 IG_ACCOUNTS_JSON = os.environ.get("IG_ACCOUNTS_JSON", "").strip()
-IG_USER_AGENT = os.environ.get(
-    "IG_USER_AGENT",
+IG_USER_AGENT = os.environ.get("IG_USER_AGENT") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
-RENDER_WEB_SERVICE_ID = os.environ.get(
-    "RENDER_WEB_SERVICE_ID", "srv-d9hjl8715fvs73eo0meg"
+RENDER_WEB_SERVICE_ID = (
+    os.environ.get("RENDER_WEB_SERVICE_ID") or "srv-d9hjl8715fvs73eo0meg"
 ).strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 DRY_RUN = os.environ.get("COOKIE_BOT_DRY_RUN", "").lower() in ("1", "true", "yes")
 SMOKE_EXTRACT_URL = os.environ.get("COOKIE_BOT_SMOKE_URL", "").strip()
-CLIENT_API_KEY = os.environ.get("LOOPHOLE_API_KEY", "LOOPHOLE_SECURE_V1_TOKEN").strip()
+CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
 
 
 def log(msg: str) -> None:
@@ -317,6 +316,7 @@ def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
         return True, "smoke skipped (COOKIE_BOT_SMOKE_URL unset)"
     if DRY_RUN:
         return True, "smoke skipped (dry run)"
+    snapshot, snap_src = fetch_live_cookies_from_backend()
     if not hot_reload_backend(netscape):
         return False, "smoke aborted: hot-reload failed before extract"
     try:
@@ -326,9 +326,21 @@ def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
             headers={"x-api-key": CLIENT_API_KEY},
             timeout=60,
         )
+        if resp.status_code in (401, 403):
+            if snapshot:
+                hot_reload_backend(snapshot)
+            return False, (
+                f"smoke auth failed HTTP {resp.status_code} "
+                f"(check LOOPHOLE_API_KEY / client token)"
+            )
         ok = resp.status_code == 200
+        if not ok and snapshot:
+            log(f"Smoke failed; restoring prior cookies from {snap_src}")
+            hot_reload_backend(snapshot)
         return ok, f"smoke extract -> {resp.status_code}"
     except Exception as e:
+        if snapshot:
+            hot_reload_backend(snapshot)
         return False, f"smoke extract error: {e}"
 
 
