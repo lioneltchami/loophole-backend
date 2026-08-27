@@ -555,7 +555,15 @@ def extract_media_generic(url: str, user_agent: str = None, use_cookies: bool = 
             except:
                 pass
 
-def send_telegram_alert(message: str):
+def send_ops_alert(message: str):
+    """Post ops alerts to Slack (preferred). Telegram is optional legacy."""
+    webhook = (os.environ.get("SLACK_WEBHOOK_URL") or "").strip()
+    if webhook:
+        try:
+            requests.post(webhook, json={"text": message}, timeout=5)
+        except Exception as e:
+            print(f"Failed to send Slack alert: {e}")
+        return
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
@@ -570,6 +578,11 @@ def send_telegram_alert(message: str):
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"Failed to send Telegram alert: {e}")
+
+
+def send_telegram_alert(message: str):
+    # Back-compat alias used by existing call sites.
+    send_ops_alert(message)
 
 def fallback_instagram_scrape(url: str, use_cookies: bool = True) -> dict:
     """

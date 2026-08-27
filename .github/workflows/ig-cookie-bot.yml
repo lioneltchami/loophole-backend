@@ -34,8 +34,7 @@ jobs:
           RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
           BACKEND_URL: ${{ secrets.BACKEND_URL }}
           COOKIE_BOT_ADMIN_KEY: ${{ secrets.COOKIE_BOT_ADMIN_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           LOOPHOLE_API_KEY: ${{ secrets.LOOPHOLE_API_KEY }}
           COOKIE_BOT_SMOKE_URL: ${{ secrets.COOKIE_BOT_SMOKE_URL }}
         run: python ig_cookie_bot.py

@@ -76,6 +76,7 @@ RENDER_WEB_SERVICE_ID = os.environ.get(
 ).strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 DRY_RUN = os.environ.get("COOKIE_BOT_DRY_RUN", "").lower() in ("1", "true", "yes")
 SMOKE_EXTRACT_URL = os.environ.get("COOKIE_BOT_SMOKE_URL", "").strip()
 CLIENT_API_KEY = os.environ.get("LOOPHOLE_API_KEY", "LOOPHOLE_SECURE_V1_TOKEN").strip()
@@ -118,22 +119,39 @@ def load_ig_accounts():
     return accounts
 
 
-def send_telegram(message: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram not configured; skipping alert")
+def send_slack(message: str) -> None:
+    """Post a plain-text ops alert to Slack Incoming Webhook."""
+    if not SLACK_WEBHOOK_URL:
+        log("SLACK_WEBHOOK_URL not configured; skipping alert")
         return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML",
-            },
+        resp = requests.post(
+            SLACK_WEBHOOK_URL,
+            json={"text": message},
             timeout=10,
         )
+        if resp.status_code >= 300:
+            log(f"Slack alert HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
-        log(f"Telegram send failed: {e}")
+        log(f"Slack send failed: {e}")
+
+
+def send_alert(message: str) -> None:
+    """Ops notifier — Slack preferred (Telegram kept as optional legacy)."""
+    send_slack(message)
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                },
+                timeout=10,
+            )
+        except Exception as e:
+            log(f"Telegram send failed: {e}")
 
 
 def ensure_netscape_header(content: str) -> str:
@@ -286,9 +304,8 @@ def probe_session_alive(netscape: str) -> tuple[bool, str]:
         )
         if status == 200 and positive and "create an account" not in body:
             return True, f"probe ok status={status}"
-        if status == 200 and session_has_sessionid(netscape) and "/accounts/login" not in final_url:
-            # Soft accept: 200 on edit without login redirect
-            return True, f"probe soft-ok status={status}"
+        # Do NOT soft-accept bare 200 + sessionid — that caused false "success"
+        # while yt-dlp still got empty Instagram JSON bodies.
         return False, f"probe inconclusive status={status}"
     except Exception as e:
         return False, f"probe error: {e}"
@@ -632,9 +649,9 @@ def main() -> int:
         log("WARNING: PROXY_URL empty — IG may block datacenter IP")
     if not ADMIN_KEY:
         log("ERROR: COOKIE_BOT_ADMIN_KEY required")
-        send_telegram(
-            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
-            "Missing <code>COOKIE_BOT_ADMIN_KEY</code>. Refusing to run."
+        send_alert(
+            "🚨 *LoopHole Cookie Bot*\n\n"
+            "Missing `COOKIE_BOT_ADMIN_KEY`. Refusing to run."
         )
         return 3
 
@@ -681,14 +698,14 @@ def main() -> int:
             alive_detail = detail
 
     if not alive:
-        safe_detail = html.escape((alive_detail or "unknown")[:240])
-        send_telegram(
-            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
+        safe_detail = (alive_detail or "unknown")[:240]
+        send_alert(
+            "🚨 *LoopHole Cookie Bot*\n\n"
             "Instagram session is dead after keep-alive/login rotation.\n"
-            f"<b>Detail:</b> <code>{safe_detail}</code>\n"
-            f"<b>Accounts tried:</b> {len(accounts)}\n\n"
+            f"*Detail:* `{safe_detail}`\n"
+            f"*Accounts tried:* {len(accounts)}\n\n"
             "Action: export fresh Netscape cookies from a dummy IG account "
-            "in real Chrome, or fix checkpoint on one of the dummy accounts."
+            "in Chrome, then hot-reload / update `IG_COOKIES`."
         )
         return 2
 
@@ -696,10 +713,10 @@ def main() -> int:
     smoke_ok, smoke_detail = smoke_extract_with_backend(netscape)
     log(smoke_detail)
     if SMOKE_EXTRACT_URL and not smoke_ok:
-        send_telegram(
-            "🚨 <b>LoopHole Cookie Bot</b>\n\n"
-            f"Liveness OK but smoke extract failed: <code>{html.escape(smoke_detail[:240])}</code>\n"
-            "Not persisting cookies."
+        send_alert(
+            "🚨 *LoopHole Cookie Bot*\n\n"
+            f"Liveness OK but smoke extract failed: `{smoke_detail[:240]}`\n"
+            "Not persisting cookies. Manual cookie refresh needed."
         )
         return 2
 
@@ -707,13 +724,13 @@ def main() -> int:
     hot_ok = hot_reload_backend(netscape)
     persist_ok = persist_to_render(netscape)
 
-    send_telegram(
-        "🍪 <b>LoopHole Cookie Bot</b>\n\n"
-        f"<b>Source:</b> {html.escape(source)}\n"
-        f"<b>Liveness:</b> {html.escape(alive_detail[:120])}\n"
-        f"<b>Smoke:</b> {html.escape(smoke_detail[:120])}\n"
-        f"<b>Hot-reload:</b> {'ok' if hot_ok else 'FAIL'}\n"
-        f"<b>Render persist:</b> {'ok' if persist_ok else 'fail/skip'}"
+    send_alert(
+        "🍪 *LoopHole Cookie Bot*\n\n"
+        f"*Source:* {source}\n"
+        f"*Liveness:* {alive_detail[:120]}\n"
+        f"*Smoke:* {smoke_detail[:120]}\n"
+        f"*Hot-reload:* {'ok' if hot_ok else 'FAIL'}\n"
+        f"*Render persist:* {'ok' if persist_ok else 'fail/skip'}"
     )
 
     # Hot-reload is required for the live process; persist alone is not success.
