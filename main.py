@@ -16,12 +16,15 @@ import gc
 import random
 import asyncio
 import threading
+from contextvars import ContextVar
 
 # Hot-reloaded Instagram cookies from ig_cookie_bot (survives until process restart).
 _RUNTIME_IG_COOKIES = None
 _RUNTIME_IG_COOKIES_LOCK = threading.Lock()
 CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
 OPS_SMOKE_HEADER = "x-loophole-ops-smoke"
+_OPS_SMOKE_REQUEST: ContextVar[bool] = ContextVar("ops_smoke_request", default=False)
+_ig_smoke_disabled_logged = False
 
 
 def _safe_int_env(name: str, default: int) -> int:
@@ -137,7 +140,7 @@ def clear_ytdlp_cache():
 @app.post("/clear-cache")
 def clear_cache_endpoint(request: Request):
     x_api_key = request.headers.get("x-api-key", "")
-    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+    if x_api_key != CLIENT_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized client signature")
         
     success = clear_ytdlp_cache()
@@ -232,6 +235,7 @@ async def ig_smoke_watchdog():
     await asyncio.sleep(max(15, startup_delay))
 
     last_alert_at = 0.0
+    global _ig_smoke_disabled_logged
     while True:
         smoke_url = (os.environ.get("COOKIE_BOT_SMOKE_URL") or "").strip()
         if smoke_url:
@@ -274,7 +278,8 @@ async def ig_smoke_watchdog():
                         )
             except Exception as e:
                 print(f"[ig-smoke] watchdog error: {e}")
-        else:
+        elif not _ig_smoke_disabled_logged:
+            _ig_smoke_disabled_logged = True
             print("[ig-smoke] COOKIE_BOT_SMOKE_URL unset; hourly smoke disabled")
 
         await asyncio.sleep(max(300, interval))
@@ -321,7 +326,7 @@ def diagnose_cookies_endpoint(request: Request):
     Scans and checks the validity of all cookies.txt files.
     """
     x_api_key = request.headers.get("x-api-key", "")
-    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+    if x_api_key != CLIENT_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized client signature")
 
     import glob
@@ -705,6 +710,8 @@ def _is_ig_cookie_death_signal(text: str) -> bool:
 
 def record_ig_extract_failure(url: str, signal: str) -> None:
     """Slack once when distinct IG reel/post URLs fail with cookie-death signals."""
+    if _OPS_SMOKE_REQUEST.get():
+        return
     if not _is_downloadable_ig_url(url):
         return
     if not _is_ig_cookie_death_signal(signal):
@@ -964,7 +971,8 @@ def extract_video(
         
     if not url:
         raise HTTPException(status_code=400, detail="URL query parameter is required")
-        
+
+    smoke_token = _OPS_SMOKE_REQUEST.set(ops_smoke)
     try:
         url_decoded = urllib.parse.unquote(url)
         url_lower = url_decoded.lower()
@@ -1401,13 +1409,14 @@ def extract_video(
             
         if "empty media response" in error_msg:
             record_ig_extract_failure(url_decoded, error_msg)
-            alert_msg = (
-                f"🚨 <b>LoopHole Alert</b>\n\n"
-                f"<b>Server:</b> <code>{server_name}</code>\n"
-                f"<b>Error:</b> Instagram Cookies Blocked / Expired 🍪\n"
-                f"<b>Action Required:</b> Please generate fresh cookies and update cookies.txt."
-            )
-            send_telegram_alert(alert_msg)
+            if not ops_smoke:
+                alert_msg = (
+                    f"🚨 <b>LoopHole Alert</b>\n\n"
+                    f"<b>Server:</b> <code>{server_name}</code>\n"
+                    f"<b>Error:</b> Instagram Cookies Blocked / Expired 🍪\n"
+                    f"<b>Action Required:</b> Please generate fresh cookies and update cookies.txt."
+                )
+                send_telegram_alert(alert_msg)
             
             detail_msg = "Instagram blocked the request (Empty Media Response). Please update or refresh the 'cookies.txt' file in your Render secrets."
             raise HTTPException(status_code=400, detail=detail_msg)
@@ -1420,7 +1429,7 @@ def extract_video(
             )
             
         # Proxy connection failures
-        if any(phrase in error_msg.lower() for phrase in ["proxyerror", "tunnel connection failed", "unable to connect to proxy", "proxy error"]):
+        if not ops_smoke and any(phrase in error_msg.lower() for phrase in ["proxyerror", "tunnel connection failed", "unable to connect to proxy", "proxy error"]):
             alert_msg = (
                 f"⚠️ <b>LoopHole Alert</b>\n\n"
                 f"<b>Server:</b> <code>{server_name}</code>\n"
@@ -1429,7 +1438,7 @@ def extract_video(
                 f"<b>Action Required:</b> Check Smartproxy dashboard bandwidth or trial limits."
             )
             send_telegram_alert(alert_msg)
-        else:
+        elif not ops_smoke:
             # Other general 500 server crashes
             if _is_downloadable_ig_url(url_decoded):
                 record_ig_extract_failure(url_decoded, error_msg)
@@ -1443,14 +1452,40 @@ def extract_video(
             send_telegram_alert(alert_msg)
             
         final_detail = f"Failed to pull video: {error_msg}"
-        try:
-            _cache_key = url_decoded.split('?')[0].rstrip('/')
-            ERROR_CACHE[_cache_key] = {"status": 500, "detail": final_detail, "expiry": time.time() + ERROR_CACHE_TTL}
-        except Exception:
-            pass
+        if not ops_smoke:
+            try:
+                _cache_key = url_decoded.split('?')[0].rstrip('/')
+                ERROR_CACHE[_cache_key] = {"status": 500, "detail": final_detail, "expiry": time.time() + ERROR_CACHE_TTL}
+            except Exception:
+                pass
         raise HTTPException(status_code=500, detail=final_detail)
     finally:
+        _OPS_SMOKE_REQUEST.reset(smoke_token)
         gc.collect()
+
+
+def _self_check() -> None:
+    """ponytail: runnable guard for ops-smoke + env parsing; upgrade path = pytest."""
+    assert _safe_int_env("__MISSING_INT__", 99) == 99
+    assert _safe_int_env("__MISSING_INT__", 99) == 99
+    os.environ["__TEST_BAD_INT__"] = "nope"
+    assert _safe_int_env("__TEST_BAD_INT__", 7) == 7
+    del os.environ["__TEST_BAD_INT__"]
+
+    assert not _is_ig_cookie_death_signal("Instagram Stories cannot be downloaded")
+    assert _is_ig_cookie_death_signal("instagram sent an empty media response")
+
+    before = len(_ig_failure_urls)
+    token = _OPS_SMOKE_REQUEST.set(True)
+    try:
+        record_ig_extract_failure(
+            "https://www.instagram.com/reel/ABC123/",
+            "empty media response",
+        )
+    finally:
+        _OPS_SMOKE_REQUEST.reset(token)
+    assert len(_ig_failure_urls) == before
+
 
 if __name__ == "__main__":
     import uvicorn

@@ -80,6 +80,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
 DRY_RUN = os.environ.get("COOKIE_BOT_DRY_RUN", "").lower() in ("1", "true", "yes")
 SMOKE_EXTRACT_URL = os.environ.get("COOKIE_BOT_SMOKE_URL", "").strip()
 CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
+OPS_SMOKE_HEADER = "x-loophole-ops-smoke"
 
 
 def log(msg: str) -> None:
@@ -350,7 +351,10 @@ def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
         resp = requests.get(
             f"{BACKEND_URL}/extract",
             params={"url": SMOKE_EXTRACT_URL},
-            headers={"x-api-key": CLIENT_API_KEY},
+            headers={
+                "x-api-key": CLIENT_API_KEY,
+                OPS_SMOKE_HEADER: "1",
+            },
             timeout=60,
         )
         if resp.status_code in (401, 403):
