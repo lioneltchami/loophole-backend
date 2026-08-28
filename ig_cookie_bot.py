@@ -293,6 +293,8 @@ def probe_session_alive(netscape: str) -> tuple[bool, str]:
                 payload = api_resp.json()
             except Exception:
                 return False, "web_form_data not JSON"
+            if str(payload.get("status", "")).lower() == "fail":
+                return False, "web_form_data status fail"
             username = (payload.get("form_data") or {}).get("username") or payload.get(
                 "username"
             )

@@ -20,6 +20,16 @@ import threading
 # Hot-reloaded Instagram cookies from ig_cookie_bot (survives until process restart).
 _RUNTIME_IG_COOKIES = None
 _RUNTIME_IG_COOKIES_LOCK = threading.Lock()
+CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
+OPS_SMOKE_HEADER = "x-loophole-ops-smoke"
+
+
+def _safe_int_env(name: str, default: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        return int(raw) if raw else default
+    except ValueError:
+        return default
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -216,9 +226,9 @@ async def ig_smoke_watchdog():
     Hourly in-process smoke extract on a known public reel.
     Catches cookie degradation between cookie-bot runs.
     """
-    startup_delay = int(os.environ.get("IG_SMOKE_STARTUP_DELAY_SEC", "45"))
-    interval = int(os.environ.get("IG_SMOKE_INTERVAL_SEC", "3600"))
-    cooldown = int(os.environ.get("IG_SMOKE_ALERT_COOLDOWN_SEC", "7200"))
+    startup_delay = _safe_int_env("IG_SMOKE_STARTUP_DELAY_SEC", 45)
+    interval = _safe_int_env("IG_SMOKE_INTERVAL_SEC", 3600)
+    cooldown = _safe_int_env("IG_SMOKE_ALERT_COOLDOWN_SEC", 7200)
     await asyncio.sleep(max(15, startup_delay))
 
     last_alert_at = 0.0
@@ -226,13 +236,15 @@ async def ig_smoke_watchdog():
         smoke_url = (os.environ.get("COOKIE_BOT_SMOKE_URL") or "").strip()
         if smoke_url:
             port = (os.environ.get("PORT") or "3000").strip()
-            api_key = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
             try:
                 resp = await asyncio.to_thread(
                     requests.get,
                     f"http://127.0.0.1:{port}/extract",
                     params={"url": smoke_url},
-                    headers={"x-api-key": api_key},
+                    headers={
+                        "x-api-key": CLIENT_API_KEY,
+                        OPS_SMOKE_HEADER: "1",
+                    },
                     timeout=90,
                 )
                 if resp.status_code == 200:
@@ -646,14 +658,6 @@ def send_telegram_alert(message: str):
 
 
 # --- IG extract failure rate alerting (live traffic) ---
-def _safe_int_env(name: str, default: int) -> int:
-    raw = (os.environ.get(name) or "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        return default
-
-
 _IG_ALERT_WINDOW_SEC = _safe_int_env("IG_ALERT_WINDOW_SEC", 600)
 _IG_ALERT_THRESHOLD = _safe_int_env("IG_ALERT_THRESHOLD", 3)
 _IG_ALERT_COOLDOWN_SEC = _safe_int_env("IG_ALERT_COOLDOWN_SEC", 1800)
@@ -950,10 +954,12 @@ ERROR_CACHE_TTL = 180  # 3 minutes
 
 @app.get("/extract")
 def extract_video(
+    request: Request,
     url: str = Query(..., description="The video/photo URL to extract metadata from"),
-    x_api_key: str = Header(None, description="Secure API key for client authentication")
+    x_api_key: str = Header(None, description="Secure API key for client authentication"),
 ):
-    if x_api_key != "LOOPHOLE_SECURE_V1_TOKEN":
+    ops_smoke = request.headers.get(OPS_SMOKE_HEADER, "").strip() == "1"
+    if x_api_key != CLIENT_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized client signature")
         
     if not url:
@@ -965,12 +971,13 @@ def extract_video(
 
         # --- ERROR CACHE CHECK ---
         _cache_key = url_decoded.split('?')[0].rstrip('/')
-        _cached = ERROR_CACHE.get(_cache_key)
-        if _cached and time.time() < _cached["expiry"]:
-            print(f"[ERROR CACHE HIT] Returning cached error for: {_cache_key[-50:]}")
-            raise HTTPException(status_code=_cached["status"], detail=_cached["detail"])
-        elif _cached:
-            del ERROR_CACHE[_cache_key]
+        if not ops_smoke:
+            _cached = ERROR_CACHE.get(_cache_key)
+            if _cached and time.time() < _cached["expiry"]:
+                print(f"[ERROR CACHE HIT] Returning cached error for: {_cache_key[-50:]}")
+                raise HTTPException(status_code=_cached["status"], detail=_cached["detail"])
+            elif _cached:
+                del ERROR_CACHE[_cache_key]
 
 
         # Friendly check for Pinterest login/error redirects
@@ -1356,15 +1363,16 @@ def extract_video(
         
     except HTTPException as he:
         # Cache every error response to block proxy-burning retries for 3 minutes
-        try:
-            _cache_key = url_decoded.split('?')[0].rstrip('/')
-            ERROR_CACHE[_cache_key] = {"status": he.status_code, "detail": he.detail, "expiry": time.time() + ERROR_CACHE_TTL}
-        except Exception:
-            pass
-        record_ig_extract_failure(
-            url_decoded,
-            he.detail if isinstance(he.detail, str) else str(he.detail),
-        )
+        if not ops_smoke:
+            try:
+                _cache_key = url_decoded.split('?')[0].rstrip('/')
+                ERROR_CACHE[_cache_key] = {"status": he.status_code, "detail": he.detail, "expiry": time.time() + ERROR_CACHE_TTL}
+            except Exception:
+                pass
+            record_ig_extract_failure(
+                url_decoded,
+                he.detail if isinstance(he.detail, str) else str(he.detail),
+            )
         raise he
     except Exception as e:
         error_msg = str(e)

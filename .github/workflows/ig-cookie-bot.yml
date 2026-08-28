@@ -44,10 +44,14 @@ jobs:
         run: python ig_cookie_bot.py
 
       - name: Slack alert on workflow failure
-        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL not set; skipping workflow failure alert"
+            exit 0
+          fi
           curl -sS -X POST "$SLACK_WEBHOOK_URL" \
             -H 'Content-Type: application/json' \
             -d '{"text":":x: *IG Cookie Bot workflow failed* — check GitHub Actions logs for loophole-backend."}'
