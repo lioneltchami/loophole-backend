@@ -24,6 +24,7 @@ _RUNTIME_IG_COOKIES_LOCK = threading.Lock()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(auto_update_ytdlp())
+    asyncio.create_task(ig_smoke_watchdog())
     yield
 
 app = FastAPI(title="LoopHole Backend", version="1.0.0", lifespan=lifespan)
@@ -209,6 +210,63 @@ def admin_ig_cookies_status(request: Request):
         "has_sessionid": bool(sessionid),
         "sessionid_len": len(sessionid) if sessionid else 0,
     }
+
+async def ig_smoke_watchdog():
+    """
+    Hourly in-process smoke extract on a known public reel.
+    Catches cookie degradation between cookie-bot runs.
+    """
+    startup_delay = int(os.environ.get("IG_SMOKE_STARTUP_DELAY_SEC", "45"))
+    interval = int(os.environ.get("IG_SMOKE_INTERVAL_SEC", "3600"))
+    cooldown = int(os.environ.get("IG_SMOKE_ALERT_COOLDOWN_SEC", "7200"))
+    await asyncio.sleep(max(15, startup_delay))
+
+    last_alert_at = 0.0
+    while True:
+        smoke_url = (os.environ.get("COOKIE_BOT_SMOKE_URL") or "").strip()
+        if smoke_url:
+            port = (os.environ.get("PORT") or "3000").strip()
+            api_key = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
+            try:
+                resp = await asyncio.to_thread(
+                    requests.get,
+                    f"http://127.0.0.1:{port}/extract",
+                    params={"url": smoke_url},
+                    headers={"x-api-key": api_key},
+                    timeout=90,
+                )
+                if resp.status_code == 200:
+                    print(f"[ig-smoke] OK reel extract ({smoke_url[-32:]})")
+                else:
+                    detail = ""
+                    try:
+                        detail = (resp.json() or {}).get("detail", "")
+                    except Exception:
+                        detail = (resp.text or "")[:200]
+                    print(
+                        f"[ig-smoke] FAIL HTTP {resp.status_code} "
+                        f"detail={str(detail)[:160]}"
+                    )
+                    now = time.time()
+                    if now - last_alert_at >= cooldown:
+                        last_alert_at = now
+                        server_name = (
+                            os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+                        )
+                        send_ops_alert(
+                            f":warning: *LoopHole IG smoke extract failed*\n"
+                            f"Server: `{server_name}`\n"
+                            f"HTTP {resp.status_code} on hourly smoke reel\n"
+                            f"Detail: `{str(detail)[:200]}`\n"
+                            f"Action: refresh IG cookies or run cookie bot"
+                        )
+            except Exception as e:
+                print(f"[ig-smoke] watchdog error: {e}")
+        else:
+            print("[ig-smoke] COOKIE_BOT_SMOKE_URL unset; hourly smoke disabled")
+
+        await asyncio.sleep(max(300, interval))
+
 
 async def auto_update_ytdlp():
     """

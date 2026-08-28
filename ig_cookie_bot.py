@@ -69,6 +69,7 @@ IG_USER_AGENT = os.environ.get("IG_USER_AGENT") or (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+IG_WEB_APP_ID = "936619743392459"
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
 RENDER_WEB_SERVICE_ID = (
     os.environ.get("RENDER_WEB_SERVICE_ID") or "srv-d9hjl8715fvs73eo0meg"
@@ -266,15 +267,48 @@ def probe_session_alive(netscape: str) -> tuple[bool, str]:
     proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
     headers = {
         "User-Agent": IG_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
+        "X-IG-App-ID": IG_WEB_APP_ID,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/accounts/edit/",
     }
 
     try:
         session, _jar = build_cffi_session(netscape)
+        api_resp = session.get(
+            "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
+            headers=headers,
+            proxies=proxies,
+            timeout=45,
+        )
+        log(
+            f"Liveness probe web_form_data -> {api_resp.status_code} "
+            f"len={len(api_resp.text or '')}"
+        )
+        if api_resp.status_code in (401, 403):
+            return False, f"web_form_data HTTP {api_resp.status_code}"
+        if api_resp.status_code == 200:
+            try:
+                payload = api_resp.json()
+            except Exception:
+                return False, "web_form_data not JSON"
+            username = (payload.get("form_data") or {}).get("username") or payload.get(
+                "username"
+            )
+            if username:
+                return True, f"web_form_data ok user={str(username)[:24]}"
+            return False, "web_form_data missing username"
+
+        # Fallback: HTML edit page must stay on /accounts/edit/ (not home or login)
+        html_headers = {
+            "User-Agent": IG_USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
         resp = session.get(
             "https://www.instagram.com/accounts/edit/",
-            headers=headers,
+            headers=html_headers,
             proxies=proxies,
             timeout=45,
             allow_redirects=True,
@@ -288,23 +322,14 @@ def probe_session_alive(netscape: str) -> tuple[bool, str]:
             return False, f"probe HTTP {status}"
         if "/accounts/login" in final_url:
             return False, "redirected to login"
+        if "/accounts/edit" not in final_url:
+            return False, f"unexpected final url={final_url[:80]}"
         if "loginform" in body or '"login_page"' in body:
             return False, "login page HTML"
-        # Logged-in edit page usually exposes email/username fields or settings chrome
-        positive = any(
-            marker in body
-            for marker in (
-                "password",
-                "email",
-                "username",
-                "accounts/edit",
-                "settings",
-            )
-        )
-        if status == 200 and positive and "create an account" not in body:
-            return True, f"probe ok status={status}"
-        # Do NOT soft-accept bare 200 + sessionid — that caused false "success"
-        # while yt-dlp still got empty Instagram JSON bodies.
+        if "create an account" in body:
+            return False, "signup page HTML"
+        if status == 200:
+            return True, f"accounts/edit ok status={status}"
         return False, f"probe inconclusive status={status}"
     except Exception as e:
         return False, f"probe error: {e}"
