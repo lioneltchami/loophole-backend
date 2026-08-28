@@ -17,10 +17,13 @@ import random
 import asyncio
 import threading
 from contextvars import ContextVar
+from typing import Optional
 
 # Hot-reloaded Instagram cookies from ig_cookie_bot (survives until process restart).
 _RUNTIME_IG_COOKIES = None
+_RUNTIME_IG_COOKIES_AT: Optional[float] = None
 _RUNTIME_IG_COOKIES_LOCK = threading.Lock()
+_PROCESS_STARTED_AT = time.time()
 CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
 OPS_SMOKE_HEADER = "x-loophole-ops-smoke"
 OPS_ADMIN_HEADER = "x-loophole-ops-admin"
@@ -143,12 +146,44 @@ def get_effective_ig_cookies():
 
 
 def set_runtime_ig_cookies(cookie_content: str) -> None:
-    global _RUNTIME_IG_COOKIES
+    global _RUNTIME_IG_COOKIES, _RUNTIME_IG_COOKIES_AT
     content = (cookie_content or "").strip()
     if content and not content.startswith("# Netscape HTTP Cookie File"):
         content = "# Netscape HTTP Cookie File\n" + content
     with _RUNTIME_IG_COOKIES_LOCK:
         _RUNTIME_IG_COOKIES = content
+        _RUNTIME_IG_COOKIES_AT = time.time()
+
+
+def _cookies_age_info() -> dict:
+    """When effective IG cookies were last established (for ops status)."""
+    with _RUNTIME_IG_COOKIES_LOCK:
+        runtime_set = bool(_RUNTIME_IG_COOKIES and _RUNTIME_IG_COOKIES.strip())
+        runtime_at = _RUNTIME_IG_COOKIES_AT
+    env_set = bool(os.environ.get("IG_COOKIES", "").strip())
+    now = time.time()
+    if runtime_set and runtime_at:
+        age = int(now - runtime_at)
+        return {
+            "cookies_effective_at": runtime_at,
+            "cookies_age_sec": age,
+            "cookies_age_hours": round(age / 3600, 2),
+            "cookies_age_source": "runtime_hot_reload",
+        }
+    if env_set:
+        age = int(now - _PROCESS_STARTED_AT)
+        return {
+            "cookies_effective_at": _PROCESS_STARTED_AT,
+            "cookies_age_sec": age,
+            "cookies_age_hours": round(age / 3600, 2),
+            "cookies_age_source": "process_start_env",
+        }
+    return {
+        "cookies_effective_at": None,
+        "cookies_age_sec": None,
+        "cookies_age_hours": None,
+        "cookies_age_source": None,
+    }
 
 # Enable CORS for the Flutter client
 app.add_middleware(
@@ -188,10 +223,8 @@ def clear_ytdlp_cache():
 
 @app.post("/clear-cache")
 def clear_cache_endpoint(request: Request):
-    x_api_key = request.headers.get("x-api-key", "")
-    if x_api_key != CLIENT_API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized client signature")
-        
+    require_cookie_bot_admin(request)
+
     success = clear_ytdlp_cache()
     if success:
         return {"status": "success", "message": "Backend cache cleared successfully"}
@@ -266,11 +299,14 @@ def admin_ig_cookies_status(request: Request):
     env_set = bool(os.environ.get("IG_COOKIES", "").strip())
     effective = get_effective_ig_cookies() or ""
     sessionid = parse_netscape_sessionid(effective)
+    age = _cookies_age_info()
     return {
         "runtime_set": runtime_set,
         "env_set": env_set,
         "has_sessionid": bool(sessionid),
         "sessionid_len": len(sessionid) if sessionid else 0,
+        "process_uptime_sec": int(time.time() - _PROCESS_STARTED_AT),
+        **age,
     }
 
 async def ig_smoke_watchdog():
@@ -284,8 +320,33 @@ async def ig_smoke_watchdog():
     await asyncio.sleep(max(15, startup_delay))
 
     last_alert_at = 0.0
+    last_stale_cookie_alert_at = 0.0
+    cookie_max_age = _safe_int_env("IG_COOKIE_MAX_AGE_SEC", 28800)
     global _ig_smoke_disabled_logged
     while True:
+        age_info = _cookies_age_info()
+        age_sec = age_info.get("cookies_age_sec")
+        if age_sec is not None and cookie_max_age > 0 and age_sec >= cookie_max_age:
+            now = time.time()
+            stale_cooldown = _safe_int_env("IG_COOKIE_STALE_ALERT_COOLDOWN_SEC", 21600)
+            if now - last_stale_cookie_alert_at >= stale_cooldown:
+                last_stale_cookie_alert_at = now
+                server_name = (
+                    os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+                )
+                send_ops_alert(
+                    f":hourglass: *LoopHole IG cookies may be stale*\n"
+                    f"Server: `{server_name}`\n"
+                    f"Age: `{age_info.get('cookies_age_hours')}h` "
+                    f"(source: {age_info.get('cookies_age_source')})\n"
+                    f"Threshold: `{cookie_max_age // 3600}h`\n"
+                    f"Action: run cookie bot or refresh `IG_COOKIES`"
+                )
+                print(
+                    f"[ig-smoke] cookies age {age_sec}s exceeds "
+                    f"IG_COOKIE_MAX_AGE_SEC={cookie_max_age}"
+                )
+
         smoke_url = (os.environ.get("COOKIE_BOT_SMOKE_URL") or "").strip()
         if smoke_url:
             port = (os.environ.get("PORT") or "3000").strip()
@@ -396,10 +457,9 @@ async def auto_update_ytdlp():
 def diagnose_cookies_endpoint(request: Request):
     """
     Scans and checks the validity of all cookies.txt files.
+    Auth: COOKIE_BOT_ADMIN_KEY (ops only — not the mobile client key).
     """
-    x_api_key = request.headers.get("x-api-key", "")
-    if x_api_key != CLIENT_API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized client signature")
+    require_cookie_bot_admin(request)
 
     import glob
     cookie_patterns = ["*cookies*.txt", "cookies*.txt"]
@@ -1029,6 +1089,33 @@ def extract_instagram_media(url: str) -> dict:
 # Safe: if cache lookup fails for any reason, code falls through to normal extraction.
 ERROR_CACHE = {}
 ERROR_CACHE_TTL = 180  # 3 minutes
+_ERROR_CACHE_MAX = _safe_int_env("ERROR_CACHE_MAX_ENTRIES", 2000)
+
+
+def _prune_error_cache(now: Optional[float] = None) -> None:
+    """Drop expired entries; cap size to avoid unbounded growth on long-lived workers."""
+    now = now if now is not None else time.time()
+    expired = [k for k, v in ERROR_CACHE.items() if now >= v.get("expiry", 0)]
+    for key in expired:
+        ERROR_CACHE.pop(key, None)
+    max_entries = max(100, _ERROR_CACHE_MAX)
+    if len(ERROR_CACHE) <= max_entries:
+        return
+    # ponytail: O(n log n) sort on overflow only; upgrade path = OrderedDict LRU
+    for key, _ in sorted(
+        ERROR_CACHE.items(), key=lambda kv: kv[1].get("expiry", 0)
+    )[: len(ERROR_CACHE) - max_entries]:
+        ERROR_CACHE.pop(key, None)
+
+
+def _error_cache_store(key: str, status: int, detail: str) -> None:
+    now = time.time()
+    _prune_error_cache(now)
+    ERROR_CACHE[key] = {
+        "status": status,
+        "detail": detail,
+        "expiry": now + ERROR_CACHE_TTL,
+    }
 
 @app.get("/extract")
 def extract_video(
@@ -1449,7 +1536,11 @@ def extract_video(
         # Cache every error response to block proxy-burning retries for 3 minutes
         if not ops_smoke and not from_error_cache:
             try:
-                ERROR_CACHE[_cache_key] = {"status": he.status_code, "detail": he.detail, "expiry": time.time() + ERROR_CACHE_TTL}
+                _error_cache_store(
+                    _cache_key,
+                    he.status_code,
+                    he.detail if isinstance(he.detail, str) else str(he.detail),
+                )
             except Exception:
                 pass
             record_ig_extract_failure(
@@ -1529,8 +1620,7 @@ def extract_video(
         final_detail = f"Failed to pull video: {error_msg}"
         if not ops_smoke:
             try:
-                _cache_key = url_decoded.split('?')[0].rstrip('/')
-                ERROR_CACHE[_cache_key] = {"status": 500, "detail": final_detail, "expiry": time.time() + ERROR_CACHE_TTL}
+                _error_cache_store(_cache_key, 500, final_detail)
             except Exception:
                 pass
         raise HTTPException(status_code=500, detail=final_detail)
@@ -1560,6 +1650,20 @@ def _self_check() -> None:
     finally:
         _OPS_SMOKE_REQUEST.reset(token)
     assert len(_ig_failure_urls) == before
+
+    ERROR_CACHE.clear()
+    cap = max(100, _ERROR_CACHE_MAX)
+    now = time.time()
+    for i in range(cap + 5):
+        ERROR_CACHE[f"url-{i}"] = {
+            "status": 400,
+            "detail": "x",
+            "expiry": now + 60 if i < 3 else now - 1,
+        }
+    _prune_error_cache(now)
+    assert len(ERROR_CACHE) <= cap
+    assert "url-0" in ERROR_CACHE
+    ERROR_CACHE.clear()
 
 
 if __name__ == "__main__":
