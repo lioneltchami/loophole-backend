@@ -81,6 +81,7 @@ DRY_RUN = os.environ.get("COOKIE_BOT_DRY_RUN", "").lower() in ("1", "true", "yes
 SMOKE_EXTRACT_URL = os.environ.get("COOKIE_BOT_SMOKE_URL", "").strip()
 CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
 OPS_SMOKE_HEADER = "x-loophole-ops-smoke"
+OPS_ADMIN_HEADER = "x-loophole-ops-admin"
 
 
 def log(msg: str) -> None:
@@ -222,7 +223,7 @@ def extract_sessionid(netscape: str) -> Optional[str]:
             continue
         value = (value or "").strip()
         if not value or value in ("0", "deleted", "null"):
-            return None
+            continue
         return value
     return None
 
@@ -338,6 +339,22 @@ def probe_session_alive(netscape: str) -> tuple[bool, str]:
         return False, f"probe error: {e}"
 
 
+def _smoke_response_ok(resp: requests.Response) -> tuple[bool, str]:
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    try:
+        data = resp.json()
+    except Exception:
+        return False, "invalid JSON body"
+    if not isinstance(data, dict):
+        return False, "non-object JSON"
+    if data.get("extractor") == "embed-nocookie":
+        return False, "cookie-free embed path (cookies not verified)"
+    if (data.get("media_urls") or []) or (data.get("Formats") or []):
+        return True, "ok"
+    return False, "empty media_urls and Formats"
+
+
 def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
     """Optional: push cookies temporarily and hit /extract on a known public Reel."""
     if not SMOKE_EXTRACT_URL:
@@ -354,6 +371,7 @@ def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
             headers={
                 "x-api-key": CLIENT_API_KEY,
                 OPS_SMOKE_HEADER: "1",
+                OPS_ADMIN_HEADER: ADMIN_KEY,
             },
             timeout=60,
         )
@@ -364,11 +382,11 @@ def smoke_extract_with_backend(netscape: str) -> tuple[bool, str]:
                 f"smoke auth failed HTTP {resp.status_code} "
                 f"(check LOOPHOLE_API_KEY / client token)"
             )
-        ok = resp.status_code == 200
+        ok, reason = _smoke_response_ok(resp)
         if not ok and snapshot:
-            log(f"Smoke failed; restoring prior cookies from {snap_src}")
+            log(f"Smoke failed ({reason}); restoring prior cookies from {snap_src}")
             hot_reload_backend(snapshot)
-        return ok, f"smoke extract -> {resp.status_code}"
+        return ok, f"smoke extract -> {resp.status_code} ({reason})"
     except Exception as e:
         if snapshot:
             hot_reload_backend(snapshot)

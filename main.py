@@ -23,8 +23,55 @@ _RUNTIME_IG_COOKIES = None
 _RUNTIME_IG_COOKIES_LOCK = threading.Lock()
 CLIENT_API_KEY = (os.environ.get("LOOPHOLE_API_KEY") or "LOOPHOLE_SECURE_V1_TOKEN").strip()
 OPS_SMOKE_HEADER = "x-loophole-ops-smoke"
+OPS_ADMIN_HEADER = "x-loophole-ops-admin"
 _OPS_SMOKE_REQUEST: ContextVar[bool] = ContextVar("ops_smoke_request", default=False)
 _ig_smoke_disabled_logged = False
+_BG_TASKS: set = set()
+
+
+def _is_trusted_ops_smoke(request: Request, header_val: str) -> bool:
+    """Ops smoke bypass only from loopback or cookie-bot admin key."""
+    if header_val != "1":
+        return False
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host in ("127.0.0.1", "::1"):
+        return True
+    admin_expected = (os.environ.get("COOKIE_BOT_ADMIN_KEY") or "").strip()
+    admin_provided = (request.headers.get(OPS_ADMIN_HEADER) or "").strip()
+    return bool(admin_expected) and admin_provided == admin_expected
+
+
+def _smoke_extract_body_ok(data: dict) -> tuple[bool, str]:
+    if not isinstance(data, dict):
+        return False, "non-object JSON"
+    if data.get("extractor") == "embed-nocookie":
+        return False, "cookie-free embed path (cookies not verified)"
+    urls = data.get("media_urls") or []
+    formats = data.get("Formats") or []
+    if urls or formats:
+        return True, "ok"
+    return False, "empty media_urls and Formats"
+
+
+def _smoke_failure_should_alert(status_code: int, detail: str, body_reason: str) -> bool:
+    if body_reason == "cookie-free embed path (cookies not verified)":
+        return True
+    if status_code == 200:
+        return body_reason != "ok"
+    lowered = (detail or "").lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "unavailable",
+            "private, deleted",
+            "not downloadable",
+            "stories cannot be downloaded",
+        )
+    ):
+        return False
+    if _is_ig_cookie_death_signal(detail):
+        return True
+    return status_code >= 500
 
 
 def _safe_int_env(name: str, default: int) -> int:
@@ -36,8 +83,10 @@ def _safe_int_env(name: str, default: int) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    asyncio.create_task(auto_update_ytdlp())
-    asyncio.create_task(ig_smoke_watchdog())
+    for coro in (auto_update_ytdlp(), ig_smoke_watchdog()):
+        task = asyncio.create_task(coro)
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
     yield
 
 app = FastAPI(title="LoopHole Backend", version="1.0.0", lifespan=lifespan)
@@ -61,7 +110,7 @@ def parse_netscape_sessionid(cookie_text: str):
             continue
         value = (value or "").strip()
         if not value or value in ("0", "deleted", "null"):
-            return None
+            continue
         return value
     return None
 
@@ -251,10 +300,19 @@ async def ig_smoke_watchdog():
                     },
                     timeout=90,
                 )
+                body_reason = "non-200"
+                detail = ""
                 if resp.status_code == 200:
-                    print(f"[ig-smoke] OK reel extract ({smoke_url[-32:]})")
+                    try:
+                        ok, body_reason = _smoke_extract_body_ok(resp.json())
+                    except Exception:
+                        ok, body_reason = False, "invalid JSON body"
+                    if ok:
+                        print(f"[ig-smoke] OK reel extract ({smoke_url[-32:]})")
+                    else:
+                        detail = body_reason
+                        print(f"[ig-smoke] FAIL body check: {body_reason}")
                 else:
-                    detail = ""
                     try:
                         detail = (resp.json() or {}).get("detail", "")
                     except Exception:
@@ -263,21 +321,35 @@ async def ig_smoke_watchdog():
                         f"[ig-smoke] FAIL HTTP {resp.status_code} "
                         f"detail={str(detail)[:160]}"
                     )
-                    now = time.time()
-                    if now - last_alert_at >= cooldown:
-                        last_alert_at = now
-                        server_name = (
-                            os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
-                        )
-                        send_ops_alert(
-                            f":warning: *LoopHole IG smoke extract failed*\n"
-                            f"Server: `{server_name}`\n"
-                            f"HTTP {resp.status_code} on hourly smoke reel\n"
-                            f"Detail: `{str(detail)[:200]}`\n"
-                            f"Action: refresh IG cookies or run cookie bot"
-                        )
+                if resp.status_code != 200 or body_reason != "ok":
+                    if _smoke_failure_should_alert(resp.status_code, str(detail), body_reason):
+                        now = time.time()
+                        if now - last_alert_at >= cooldown:
+                            last_alert_at = now
+                            server_name = (
+                                os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+                            )
+                            send_ops_alert(
+                                f":warning: *LoopHole IG smoke extract failed*\n"
+                                f"Server: `{server_name}`\n"
+                                f"HTTP {resp.status_code} on hourly smoke reel\n"
+                                f"Detail: `{str(detail or body_reason)[:200]}`\n"
+                                f"Action: refresh IG cookies or run cookie bot"
+                            )
             except Exception as e:
                 print(f"[ig-smoke] watchdog error: {e}")
+                now = time.time()
+                if now - last_alert_at >= cooldown:
+                    last_alert_at = now
+                    server_name = (
+                        os.environ.get("RENDER_EXTERNAL_HOSTNAME") or "LoopHole Backend"
+                    )
+                    send_ops_alert(
+                        f":warning: *LoopHole IG smoke watchdog error*\n"
+                        f"Server: `{server_name}`\n"
+                        f"Error: `{str(e)[:200]}`\n"
+                        f"Action: check backend health / proxy / cookies"
+                    )
         elif not _ig_smoke_disabled_logged:
             _ig_smoke_disabled_logged = True
             print("[ig-smoke] COOKIE_BOT_SMOKE_URL unset; hourly smoke disabled")
@@ -636,21 +708,19 @@ def send_ops_alert(message: str):
     if webhook:
         try:
             resp = requests.post(webhook, json={"text": message}, timeout=5)
-            if resp.status_code >= 400:
-                print(f"Slack alert failed HTTP {resp.status_code}: {resp.text[:200]}")
+            if resp.status_code < 400:
+                return
+            print(f"Slack alert failed HTTP {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             print(f"Failed to send Slack alert: {e}")
-        return
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     chat_id = os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
+        if not webhook:
+            print(f"[ops-alert] no SLACK_WEBHOOK_URL or Telegram configured; dropped: {message[:120]}")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": chat_id, "text": message}
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
@@ -949,6 +1019,7 @@ def extract_instagram_media(url: str) -> dict:
         "media_urls": media_urls,
         "Video Title": "Instagram Post",
         "Thumbnail URL": thumbnail,
+        "extractor": "embed-nocookie",
     }
 
 
@@ -965,7 +1036,9 @@ def extract_video(
     url: str = Query(..., description="The video/photo URL to extract metadata from"),
     x_api_key: str = Header(None, description="Secure API key for client authentication"),
 ):
-    ops_smoke = request.headers.get(OPS_SMOKE_HEADER, "").strip() == "1"
+    ops_smoke = _is_trusted_ops_smoke(
+        request, request.headers.get(OPS_SMOKE_HEADER, "").strip()
+    )
     if x_api_key != CLIENT_API_KEY:
         raise HTTPException(status_code=403, detail="Unauthorized client signature")
         
@@ -973,19 +1046,21 @@ def extract_video(
         raise HTTPException(status_code=400, detail="URL query parameter is required")
 
     smoke_token = _OPS_SMOKE_REQUEST.set(ops_smoke)
+    from_error_cache = False
     try:
         url_decoded = urllib.parse.unquote(url)
         url_lower = url_decoded.lower()
 
-        # --- ERROR CACHE CHECK ---
+        # --- ERROR CACHE CHECK (key from original URL, before share-link unwrap) ---
         _cache_key = url_decoded.split('?')[0].rstrip('/')
         if not ops_smoke:
             _cached = ERROR_CACHE.get(_cache_key)
             if _cached and time.time() < _cached["expiry"]:
                 print(f"[ERROR CACHE HIT] Returning cached error for: {_cache_key[-50:]}")
+                from_error_cache = True
                 raise HTTPException(status_code=_cached["status"], detail=_cached["detail"])
             elif _cached:
-                del ERROR_CACHE[_cache_key]
+                ERROR_CACHE.pop(_cache_key, None)
 
 
         # Friendly check for Pinterest login/error redirects
@@ -1341,7 +1416,8 @@ def extract_video(
             "Thumbnail URL": info.get("thumbnail") or (info.get("thumbnails", [{}])[0].get("url") if info.get("thumbnails") else ""),
             "Formats": formats,
             "media_type": media_type,
-            "media_urls": media_urls
+            "media_urls": media_urls,
+            "extractor": info.get("_extractor") or "ytdlp",
         }
 
         # TikTok CDN links are only served to the session that requested them,
@@ -1371,9 +1447,8 @@ def extract_video(
         
     except HTTPException as he:
         # Cache every error response to block proxy-burning retries for 3 minutes
-        if not ops_smoke:
+        if not ops_smoke and not from_error_cache:
             try:
-                _cache_key = url_decoded.split('?')[0].rstrip('/')
                 ERROR_CACHE[_cache_key] = {"status": he.status_code, "detail": he.detail, "expiry": time.time() + ERROR_CACHE_TTL}
             except Exception:
                 pass
@@ -1488,5 +1563,6 @@ def _self_check() -> None:
 
 
 if __name__ == "__main__":
+    _self_check()
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 3000)))

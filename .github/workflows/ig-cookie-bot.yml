@@ -10,6 +10,9 @@ concurrency:
   group: ig-cookie-bot
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   refresh:
     runs-on: ubuntu-latest
@@ -24,7 +27,11 @@ jobs:
       - name: Install deps + Chromium
         run: |
           pip install -r requirements-cookie-bot.txt
+          pip install -r requirements.txt
           playwright install --with-deps chromium
+
+      - name: Backend self-check
+        run: python -c "from main import _self_check; _self_check(); print('self_check OK')"
 
       - name: Refresh Instagram cookies
         env:
