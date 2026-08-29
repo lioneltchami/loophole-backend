@@ -326,7 +326,14 @@ async def ig_smoke_watchdog():
     while True:
         age_info = _cookies_age_info()
         age_sec = age_info.get("cookies_age_sec")
-        if age_sec is not None and cookie_max_age > 0 and age_sec >= cookie_max_age:
+        # Only alert on true hot-reload age — process_start_env is uptime,
+        # not cookie birth time, and would false-positive after long uptime.
+        if (
+            age_info.get("cookies_age_source") == "runtime_hot_reload"
+            and age_sec is not None
+            and cookie_max_age > 0
+            and age_sec >= cookie_max_age
+        ):
             now = time.time()
             stale_cooldown = _safe_int_env("IG_COOKIE_STALE_ALERT_COOLDOWN_SEC", 21600)
             if now - last_stale_cookie_alert_at >= stale_cooldown:
@@ -338,7 +345,7 @@ async def ig_smoke_watchdog():
                     f":hourglass: *LoopHole IG cookies may be stale*\n"
                     f"Server: `{server_name}`\n"
                     f"Age: `{age_info.get('cookies_age_hours')}h` "
-                    f"(source: {age_info.get('cookies_age_source')})\n"
+                    f"(source: runtime_hot_reload)\n"
                     f"Threshold: `{cookie_max_age // 3600}h`\n"
                     f"Action: run cookie bot or refresh `IG_COOKIES`"
                 )
@@ -1654,15 +1661,26 @@ def _self_check() -> None:
     ERROR_CACHE.clear()
     cap = max(100, _ERROR_CACHE_MAX)
     now = time.time()
+    # Expired prune path
+    for i in range(10):
+        ERROR_CACHE[f"exp-{i}"] = {
+            "status": 400,
+            "detail": "x",
+            "expiry": now - 1,
+        }
+    ERROR_CACHE["keep"] = {"status": 400, "detail": "x", "expiry": now + 60}
+    _prune_error_cache(now)
+    assert "keep" in ERROR_CACHE and "exp-0" not in ERROR_CACHE
+    ERROR_CACHE.clear()
+    # Overflow cap path (all live entries)
     for i in range(cap + 5):
         ERROR_CACHE[f"url-{i}"] = {
             "status": 400,
             "detail": "x",
-            "expiry": now + 60 if i < 3 else now - 1,
+            "expiry": now + 60 + i,
         }
     _prune_error_cache(now)
-    assert len(ERROR_CACHE) <= cap
-    assert "url-0" in ERROR_CACHE
+    assert len(ERROR_CACHE) == cap
     ERROR_CACHE.clear()
 
 
