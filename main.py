@@ -49,6 +49,11 @@ def _smoke_extract_body_ok(data: dict) -> tuple[bool, str]:
         return False, "non-object JSON"
     if data.get("extractor") == "embed-nocookie":
         return False, "cookie-free embed path (cookies not verified)"
+    if data.get("extractor") == "scrapecreators":
+        urls = data.get("media_urls") or []
+        if urls:
+            return True, "ok"
+        return False, "scrapecreators empty media_urls"
     urls = data.get("media_urls") or []
     formats = data.get("Formats") or []
     if urls or formats:
@@ -913,6 +918,146 @@ def fallback_instagram_scrape_generic(url: str, use_cookies: bool = True) -> dic
     except Exception as e:
         raise Exception(f"Fallback mobile generic scraper also failed: {str(e)}")
 
+
+SCRAPECREATORS_API_URL = "https://api.scrapecreators.com/v1/instagram/post"
+
+
+def _scrapecreators_api_key() -> str:
+    return (os.environ.get("SCRAPECREATORS_API_KEY") or "").strip()
+
+
+def _scrapecreators_ig_mode() -> str:
+    """fallback (default) | primary"""
+    return (os.environ.get("SCRAPECREATORS_IG_MODE") or "fallback").strip().lower()
+
+
+def _scrapecreators_configured() -> bool:
+    return bool(_scrapecreators_api_key())
+
+
+def _scrapecreators_download_media() -> bool:
+    return (os.environ.get("SCRAPECREATORS_DOWNLOAD_MEDIA") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _parse_scrapecreators_media(media: dict) -> tuple[str, list[str], str]:
+    """Return (media_type, urls, thumbnail) from xdt_shortcode_media."""
+    if not isinstance(media, dict):
+        raise ValueError("missing xdt_shortcode_media")
+
+    thumbnail = (
+        media.get("thumbnail_src")
+        or media.get("display_url")
+        or ""
+    )
+    typename = str(media.get("__typename") or "")
+    urls: list[str] = []
+
+    if typename == "XDTGraphSidecar" or media.get("edge_sidecar_to_children"):
+        media_type = "carousel"
+        edges = (media.get("edge_sidecar_to_children") or {}).get("edges") or []
+        for edge in edges:
+            node = (edge or {}).get("node") or {}
+            if node.get("is_video") and node.get("video_url"):
+                urls.append(str(node["video_url"]))
+            elif node.get("display_url"):
+                urls.append(str(node["display_url"]))
+    elif media.get("is_video") or typename == "XDTGraphVideo" or media.get("video_url"):
+        media_type = "video"
+        if media.get("video_url"):
+            urls.append(str(media["video_url"]))
+        elif media.get("display_url"):
+            urls.append(str(media["display_url"]))
+    else:
+        media_type = "photo"
+        if media.get("display_url"):
+            urls.append(str(media["display_url"]))
+
+    urls = [u for u in urls if u.startswith("http")]
+    if not urls:
+        raise ValueError("ScrapeCreators response had no media URLs")
+    if not thumbnail and urls:
+        thumbnail = urls[0]
+    return media_type, urls, thumbnail
+
+
+def _scrapecreators_title(media: dict) -> str:
+    edges = (media.get("edge_media_to_caption") or {}).get("edges") or []
+    if edges:
+        text = ((edges[0] or {}).get("node") or {}).get("text") or ""
+        text = str(text).strip()
+        if text:
+            return text[:200]
+    owner = media.get("owner") or {}
+    username = str(owner.get("username") or "").strip()
+    if username:
+        return f"@{username} on Instagram"
+    return "Instagram Post"
+
+
+def extract_instagram_scrapecreators(url: str) -> dict:
+    """
+    Instagram extract via ScrapeCreators API (paid fallback / optional primary).
+    Default: 1 credit/request (IG CDN URLs). download_media=true costs 10 credits.
+    """
+    api_key = _scrapecreators_api_key()
+    if not api_key:
+        raise ValueError("SCRAPECREATORS_API_KEY not configured")
+
+    params = {
+        "url": url,
+        "trim": "true",
+        "include_play_count": "false",
+    }
+    if _scrapecreators_download_media():
+        params["download_media"] = "true"
+    cache_age = (os.environ.get("SCRAPECREATORS_CACHE_MAX_AGE") or "7d").strip()
+    if cache_age:
+        params["cache_max_age"] = cache_age
+
+    resp = requests.get(
+        SCRAPECREATORS_API_URL,
+        params=params,
+        headers={"x-api-key": api_key},
+        timeout=45,
+    )
+    if resp.status_code == 403:
+        raise ValueError("ScrapeCreators API key rejected (403)")
+    if resp.status_code >= 400:
+        detail = (resp.text or "")[:240]
+        raise ValueError(f"ScrapeCreators HTTP {resp.status_code}: {detail}")
+
+    payload = resp.json()
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise ValueError("ScrapeCreators returned success=false")
+
+    media = ((payload.get("data") or {}).get("xdt_shortcode_media")) or {}
+    media_type, media_urls, thumbnail = _parse_scrapecreators_media(media)
+    title = _scrapecreators_title(media)
+    credits = payload.get("credits_charged")
+    cached = payload.get("cached")
+    print(
+        f"[scrapecreators] ok type={media_type} urls={len(media_urls)} "
+        f"credits={credits} cached={cached}"
+    )
+
+    info: dict = {
+        "title": title,
+        "url": media_urls[0],
+        "thumbnail": thumbnail,
+        "_extractor": "scrapecreators",
+        "_media_type": media_type,
+    }
+    if len(media_urls) > 1:
+        info["entries"] = [
+            {"url": u, "ext": "mp4" if media_type == "video" else "jpg"}
+            for u in media_urls
+        ]
+    return info
+
 def extract_instagram_media(url: str) -> dict:
     """
     Extracts Instagram photos, carousels, and videos using the PUBLIC
@@ -1257,6 +1402,17 @@ def extract_video(
         is_photo_fallback = False
 
         is_hybrid_platform = any(domain in url_lower for domain in ["facebook.com", "fb.watch", "fb.gg", "pinterest.com", "pin.it"])
+        is_instagram = "instagram.com" in url_lower
+
+        if (
+            is_instagram
+            and _scrapecreators_configured()
+            and _scrapecreators_ig_mode() == "primary"
+        ):
+            try:
+                info = extract_instagram_scrapecreators(url_decoded)
+            except Exception as sc_primary_err:
+                print(f"ScrapeCreators primary failed: {sc_primary_err}. Trying yt-dlp...")
         
         # --- Facebook Share Link Unwrapper ---
         # Automatically resolve short share links (e.g. /share/v/) to their true /reel/ or /watch/ URLs
@@ -1280,160 +1436,182 @@ def extract_video(
                 )
                 
         # 1. Primary extraction with or without cookies
-        try:
-            if is_hybrid_platform:
-                try:
-                    info = extract_with_ytdlp(url_decoded, use_cookies=False)
-                except Exception as e:
-                    print(f"Extraction without cookies failed for {url_decoded}: {e}. Retrying with cookies...")
-                    info = extract_with_ytdlp(url_decoded, use_cookies=True)
-            else:
-                info = extract_with_ytdlp(url_decoded, use_cookies=True)
-        except Exception as primary_error:
-            primary_msg = str(primary_error)
-            print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
-                
-            is_private = any(phrase in primary_msg.lower() for phrase in [
-                "this content isn't available to everyone",
-                "this content is only available for registered users",
-                "login required",
-                "private account",
-                "private video",
-                "requires authentication",
-                "login_via",
-                "/login/"
-            ])
-            
-
-            if is_private:
-                if _is_downloadable_ig_url(url_decoded):
-                    record_ig_extract_failure(url_decoded, primary_msg)
-                raise HTTPException(
-                    status_code=403,
-                    detail="This content is private or age-restricted."
-                )
-
-            # --- TikTok fast-fail ---
-            # Every fallback below is an Instagram scraper; running them on a
-            # TikTok URL only burns time (and proxy bandwidth) before failing.
-            tiktok_handled = False
-            if is_tiktok_url(url_decoded):
-                tiktok_handled = True
-                lowered = primary_msg.lower()
-                # Match on error phrasing only — a bare "404" would also hit
-                # video IDs that happen to contain those digits.
-                if any(term in lowered for term in ["unable to find video in feed", "video not available", "404: not found", "http error 404", "does not exist", "has been removed"]):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="This video is unavailable. It may be deleted, private, or restricted in your region. 🚫"
-                    )
-                if any(term in lowered for term in ["ip address is blocked", "geo-restrict", "geo restrict", "not available in your region", "unavailable in your region"]):
-                    raise HTTPException(
-                        status_code=400,
-                        detail="This video is blocked in our server's region. 🌍"
-                    )
-                # One retry with a clean cache: TikTok's web challenge is flaky
-                # and usually clears on a second pass. Slideshow posts have no
-                # mp4 at all, so those retry without the video-only filter.
-                wants_photo = any(term in lowered for term in ["no video", "no formats", "playlist", "expecting value", "extra data"])
-                try:
-                    clear_ytdlp_cache()
-                    if wants_photo:
-                        info = extract_media_generic(url_decoded, use_cookies=False)
-                    else:
+        if info is None:
+            try:
+                if is_hybrid_platform:
+                    try:
                         info = extract_with_ytdlp(url_decoded, use_cookies=False)
-                except Exception as tiktok_retry_error:
-                    print(f"TikTok retry failed: {tiktok_retry_error}")
-                    info = None
-                if not info:
+                    except Exception as e:
+                        print(f"Extraction without cookies failed for {url_decoded}: {e}. Retrying with cookies...")
+                        info = extract_with_ytdlp(url_decoded, use_cookies=True)
+                else:
+                    info = extract_with_ytdlp(url_decoded, use_cookies=True)
+            except Exception as primary_error:
+                primary_msg = str(primary_error)
+                print(f"Primary video extraction failed: {primary_msg}. Checking fallback...")
+                
+                is_private = any(phrase in primary_msg.lower() for phrase in [
+                    "this content isn't available to everyone",
+                    "this content is only available for registered users",
+                    "login required",
+                    "private account",
+                    "private video",
+                    "requires authentication",
+                    "login_via",
+                    "/login/"
+                ])
+                
+
+                if is_private:
+                    if _is_downloadable_ig_url(url_decoded):
+                        record_ig_extract_failure(url_decoded, primary_msg)
                     raise HTTPException(
-                        status_code=400,
-                        detail="Could not read this video. Please make sure the link is public and try again."
+                        status_code=403,
+                        detail="This content is private or age-restricted."
                     )
 
-            
-            # Check for Facebook video format that yt-dlp cannot currently parse
-            # This happens with old-style Facebook /videos/ posts (not Reels)
-            if "cannot parse data" in primary_msg.lower() and any(fb in url_decoded.lower() for fb in ["facebook.com", "fb.watch", "fb.gg"]):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Sorry, this specific Facebook video format is currently unsupported. Try sharing a Facebook Reel instead."
-                )
-
-
-            # Fast-fail for Instagram "empty media response" — all fallbacks also fail for this error,
-            # so we save 2 proxy hits by stopping here immediately.
-            # This happens when a reel is private, deleted, or geo-restricted.
-            if "empty media response" in primary_msg.lower() and "instagram.com" in url_decoded.lower():
-                if _is_downloadable_ig_url(url_decoded):
-                    record_ig_extract_failure(url_decoded, primary_msg)
-                raise HTTPException(
-                    status_code=400,
-                    detail="This Instagram post is unavailable. It may be private, deleted, or restricted in your region. 🚫"
-                )
-
-            # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
-            if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "expecting value", "extra data"]):
-                is_photo_fallback = True
-            
-            # If not explicitly a photo fallback, try video fallback first
-            if not is_photo_fallback and not tiktok_handled:
-                try:
-                    clear_ytdlp_cache()
-                    info = fallback_instagram_scrape(url_decoded, use_cookies=True)
-                except Exception as fallback_error:
-                    fallback_msg = str(fallback_error).lower()
-                    print(f"Fallback video extraction also failed: {fallback_msg}. Checking Instagram blocks...")
-                    
-                    # Instagram specific blocks checked ONLY after fallback fails
-                    if "instagram.com" in url_decoded.lower() and any(err in fallback_msg for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response", "400: bad request"]):
-                        print("Instagram blocked yt-dlp. Trying last-resort curl_cffi embed scraper...")
-                        try:
-                            info = extract_instagram_media(url_decoded)
-                            return info
-                        except Exception as embed_err:
-                            print(f"Last resort embed scraper failed: {embed_err}")
-                            raise HTTPException(
-                                status_code=400,
-                                detail="Instagram download failed. The post is either private, deleted, or our server cookies have expired."
-                            )
-                    
-                    print(f"No specific Instagram block found. Trying generic media extraction...")
-                    is_photo_fallback = True
-            
-            # If we determined we need photo/generic extraction
-            if is_photo_fallback and not tiktok_handled:
-                if "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower():
-                    # Fail fast for Pinterest instead of wasting 30 seconds on generic extractors
-                    error_str = primary_msg.lower()
-                    if "pinterestcollection" in error_str or "404" in error_str:
+                # --- TikTok fast-fail ---
+                # Every fallback below is an Instagram scraper; running them on a
+                # TikTok URL only burns time (and proxy bandwidth) before failing.
+                tiktok_handled = False
+                if is_tiktok_url(url_decoded):
+                    tiktok_handled = True
+                    lowered = primary_msg.lower()
+                    # Match on error phrasing only — a bare "404" would also hit
+                    # video IDs that happen to contain those digits.
+                    if any(term in lowered for term in ["unable to find video in feed", "video not available", "404: not found", "http error 404", "does not exist", "has been removed"]):
                         raise HTTPException(
                             status_code=400,
-                            detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
+                            detail="This video is unavailable. It may be deleted, private, or restricted in your region. 🚫"
                         )
-                    else:
+                    if any(term in lowered for term in ["ip address is blocked", "geo-restrict", "geo restrict", "not available in your region", "unavailable in your region"]):
                         raise HTTPException(
                             status_code=400,
-                            detail="This Pinterest link appears to be an image. 📌 You can download photos directly in Pinterest by tapping the three dots and choosing 'Download image'."
+                            detail="This video is blocked in our server's region. 🌍"
                         )
-                        
-                try:
-                    info = extract_media_generic(url_decoded, use_cookies=True)
-                except Exception as generic_error:
-                    print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
+                    # One retry with a clean cache: TikTok's web challenge is flaky
+                    # and usually clears on a second pass. Slideshow posts have no
+                    # mp4 at all, so those retry without the video-only filter.
+                    wants_photo = any(term in lowered for term in ["no video", "no formats", "playlist", "expecting value", "extra data"])
                     try:
                         clear_ytdlp_cache()
-                        info = fallback_instagram_scrape_generic(url_decoded, use_cookies=True)
-                    except Exception as fallback_gen_error:
+                        if wants_photo:
+                            info = extract_media_generic(url_decoded, use_cookies=False)
+                        else:
+                            info = extract_with_ytdlp(url_decoded, use_cookies=False)
+                    except Exception as tiktok_retry_error:
+                        print(f"TikTok retry failed: {tiktok_retry_error}")
+                        info = None
+                    if not info:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                            detail="Could not read this video. Please make sure the link is public and try again."
                         )
+
+                
+                # Check for Facebook video format that yt-dlp cannot currently parse
+                # This happens with old-style Facebook /videos/ posts (not Reels)
+                if "cannot parse data" in primary_msg.lower() and any(fb in url_decoded.lower() for fb in ["facebook.com", "fb.watch", "fb.gg"]):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Sorry, this specific Facebook video format is currently unsupported. Try sharing a Facebook Reel instead."
+                    )
+
+
+                # Fast-fail for Instagram "empty media response" — all fallbacks also fail for this error,
+                # so we save 2 proxy hits by stopping here immediately.
+                # This happens when a reel is private, deleted, or geo-restricted.
+                if "empty media response" in primary_msg.lower() and "instagram.com" in url_decoded.lower():
+                    if _is_downloadable_ig_url(url_decoded):
+                        record_ig_extract_failure(url_decoded, primary_msg)
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This Instagram post is unavailable. It may be private, deleted, or restricted in your region. 🚫"
+                    )
+
+                # Check if this error indicates there is no video in the post (meaning it's a photo or carousel)
+                if any(term in primary_msg.lower() for term in ["no video", "no formats", "playlist", "expecting value", "extra data"]):
+                    is_photo_fallback = True
+                
+                # If not explicitly a photo fallback, try video fallback first
+                if not is_photo_fallback and not tiktok_handled:
+                    try:
+                        clear_ytdlp_cache()
+                        info = fallback_instagram_scrape(url_decoded, use_cookies=True)
+                    except Exception as fallback_error:
+                        fallback_msg = str(fallback_error).lower()
+                        print(f"Fallback video extraction also failed: {fallback_msg}. Checking Instagram blocks...")
+                        
+                        # Instagram specific blocks checked ONLY after fallback fails
+                        if "instagram.com" in url_decoded.lower() and any(err in fallback_msg for err in ["401: unauthorized", "404: not found", "unreachable", "redirect to login", "this content is unreachable", "empty media response", "400: bad request"]):
+                            if _scrapecreators_configured() and _scrapecreators_ig_mode() != "off":
+                                print("Instagram blocked yt-dlp. Trying ScrapeCreators...")
+                                try:
+                                    info = extract_instagram_scrapecreators(url_decoded)
+                                except Exception as sc_err:
+                                    print(f"ScrapeCreators fallback failed: {sc_err}")
+                                    info = None
+                            if not info:
+                                print("Trying last-resort curl_cffi embed scraper...")
+                                try:
+                                    info = extract_instagram_media(url_decoded)
+                                    return info
+                                except Exception as embed_err:
+                                    print(f"Last resort embed scraper failed: {embed_err}")
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail="Instagram download failed. The post is either private, deleted, or our server cookies have expired."
+                                    )
+                        
+                        print(f"No specific Instagram block found. Trying generic media extraction...")
+                        is_photo_fallback = True
+                
+                # If we determined we need photo/generic extraction
+                if is_photo_fallback and not tiktok_handled:
+                    if "pinterest.com" in url_decoded.lower() or "pin.it" in url_decoded.lower():
+                        # Fail fast for Pinterest instead of wasting 30 seconds on generic extractors
+                        error_str = primary_msg.lower()
+                        if "pinterestcollection" in error_str or "404" in error_str:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="This link is for a Pinterest Board or Collection. 📌 Please copy the link to a single video Pin instead!"
+                            )
+                        else:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="This Pinterest link appears to be an image. 📌 You can download photos directly in Pinterest by tapping the three dots and choosing 'Download image'."
+                            )
+                            
+                    try:
+                        info = extract_media_generic(url_decoded, use_cookies=True)
+                    except Exception as generic_error:
+                        print(f"Primary generic extraction failed: {generic_error}. Trying fallback generic...")
+                        try:
+                            clear_ytdlp_cache()
+                            info = fallback_instagram_scrape_generic(url_decoded, use_cookies=True)
+                        except Exception as fallback_gen_error:
+                            if (
+                                "instagram.com" in url_decoded.lower()
+                                and _scrapecreators_configured()
+                                and _scrapecreators_ig_mode() != "off"
+                            ):
+                                try:
+                                    info = extract_instagram_scrapecreators(url_decoded)
+                                except Exception as sc_err:
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                                    ) from sc_err
+                            else:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Failed to extract photo/carousel: {str(fallback_gen_error)}"
+                                )
         if not info:
             raise Exception("Failed to extract media info from any source")
             
         # Parse media type and urls
-        media_type = "video"
+        media_type = info.get("_media_type") or "video"
         media_urls = []
         
         if "entries" in info:
