@@ -1030,8 +1030,15 @@ def extract_instagram_scrapecreators(url: str) -> dict:
         raise ValueError(f"ScrapeCreators HTTP {resp.status_code}: {detail}")
 
     payload = resp.json()
-    if not isinstance(payload, dict) or not payload.get("success"):
-        raise ValueError("ScrapeCreators returned success=false")
+    if not isinstance(payload, dict):
+        raise ValueError("ScrapeCreators returned invalid JSON")
+    if not payload.get("success"):
+        err = str(payload.get("error") or "").strip().lower()
+        msg = str(payload.get("message") or "").strip()
+        if err in ("not_found", "private", "login_required", "invalid_url"):
+            detail = msg or "This Instagram post is unavailable. It may be private, deleted, or restricted."
+            raise HTTPException(status_code=400, detail=detail)
+        raise ValueError(msg or "ScrapeCreators returned success=false")
 
     media = ((payload.get("data") or {}).get("xdt_shortcode_media")) or {}
     media_type, media_urls, thumbnail = _parse_scrapecreators_media(media)
@@ -1051,10 +1058,21 @@ def extract_instagram_scrapecreators(url: str) -> dict:
         "_media_type": media_type,
     }
     if len(media_urls) > 1:
-        info["entries"] = [
-            {"url": u, "ext": "mp4" if media_type == "video" else "jpg"}
-            for u in media_urls
-        ]
+        entries = []
+        if media_type == "carousel":
+            edges = (media.get("edge_sidecar_to_children") or {}).get("edges") or []
+            for edge in edges:
+                node = (edge or {}).get("node") or {}
+                if node.get("is_video") and node.get("video_url"):
+                    entries.append({"url": str(node["video_url"]), "ext": "mp4"})
+                elif node.get("display_url"):
+                    entries.append({"url": str(node["display_url"]), "ext": "jpg"})
+        if not entries:
+            entries = [
+                {"url": u, "ext": "mp4" if media_type == "video" else "jpg"}
+                for u in media_urls
+            ]
+        info["entries"] = entries
     return info
 
 def extract_instagram_media(url: str) -> dict:
@@ -1410,6 +1428,8 @@ def extract_video(
         ):
             try:
                 info = extract_instagram_scrapecreators(url_decoded)
+            except HTTPException:
+                raise
             except Exception as sc_primary_err:
                 print(f"ScrapeCreators primary failed: {sc_primary_err}. Trying yt-dlp...")
         
@@ -1618,10 +1638,11 @@ def extract_video(
             entries = info["entries"]
             media_urls = [entry.get("url") for entry in entries if entry.get("url")]
             
-            # Check if entries are photos
-            first_entry_ext = entries[0].get("ext", "") if entries else ""
-            if first_entry_ext in ["jpg", "jpeg", "png", "webp"]:
-                media_type = "photo"
+            # Check if entries are photos (don't downgrade carousel type)
+            if media_type != "carousel":
+                first_entry_ext = entries[0].get("ext", "") if entries else ""
+                if first_entry_ext in ["jpg", "jpeg", "png", "webp"]:
+                    media_type = "photo"
         else:
             # Single item
             url_val = info.get("url")
