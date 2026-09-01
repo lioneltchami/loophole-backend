@@ -1009,7 +1009,6 @@ def extract_instagram_scrapecreators(url: str) -> dict:
 
     params = {
         "url": url,
-        "trim": "true",
         "include_play_count": "false",
     }
     if _scrapecreators_download_media():
