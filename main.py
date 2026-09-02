@@ -998,6 +998,25 @@ def _scrapecreators_title(media: dict) -> str:
     return "Instagram Post"
 
 
+def _scrapecreators_user_error(payload: dict) -> HTTPException | None:
+    """Map ScrapeCreators error fields to a client-facing response."""
+    if not isinstance(payload, dict):
+        return None
+    err = str(payload.get("error") or "").strip().lower()
+    msg = str(payload.get("message") or "").strip()
+    if err in ("not_found", "private", "login_required", "invalid_url"):
+        return HTTPException(
+            status_code=400,
+            detail=msg or "This Instagram post is unavailable. It may be private, deleted, or restricted.",
+        )
+    if err == "forbidden" or "age restricted" in msg.lower():
+        return HTTPException(
+            status_code=400,
+            detail=msg or "This Instagram post is age-restricted and cannot be downloaded.",
+        )
+    return None
+
+
 def extract_instagram_scrapecreators(url: str) -> dict:
     """
     Instagram extract via ScrapeCreators API (paid fallback / optional primary).
@@ -1023,22 +1042,36 @@ def extract_instagram_scrapecreators(url: str) -> dict:
         headers={"x-api-key": api_key},
         timeout=45,
     )
-    if resp.status_code == 403:
+
+    payload = None
+    try:
+        payload = resp.json() if resp.content else None
+    except ValueError:
+        payload = None
+
+    if isinstance(payload, dict):
+        user_err = _scrapecreators_user_error(payload)
+        if user_err:
+            print(
+                f"[scrapecreators] blocked http={resp.status_code} "
+                f"error={payload.get('error')} — {str(payload.get('message') or '')[:120]}"
+            )
+            raise user_err
+        if resp.status_code == 403:
+            raise ValueError("ScrapeCreators API key rejected (403)")
+    elif resp.status_code == 403:
         raise ValueError("ScrapeCreators API key rejected (403)")
+
     if resp.status_code >= 400:
         detail = (resp.text or "")[:240]
         raise ValueError(f"ScrapeCreators HTTP {resp.status_code}: {detail}")
 
-    payload = resp.json()
     if not isinstance(payload, dict):
         raise ValueError("ScrapeCreators returned invalid JSON")
     if not payload.get("success"):
-        err = str(payload.get("error") or "").strip().lower()
-        msg = str(payload.get("message") or "").strip()
-        if err in ("not_found", "private", "login_required", "invalid_url"):
-            detail = msg or "This Instagram post is unavailable. It may be private, deleted, or restricted."
-            raise HTTPException(status_code=400, detail=detail)
-        raise ValueError(msg or "ScrapeCreators returned success=false")
+        raise ValueError(
+            str(payload.get("message") or "").strip() or "ScrapeCreators returned success=false"
+        )
 
     media = ((payload.get("data") or {}).get("xdt_shortcode_media")) or {}
     media_type, media_urls, thumbnail = _parse_scrapecreators_media(media)
@@ -1567,6 +1600,8 @@ def extract_video(
                                 print("Instagram blocked yt-dlp. Trying ScrapeCreators...")
                                 try:
                                     info = extract_instagram_scrapecreators(url_decoded)
+                                except HTTPException:
+                                    raise
                                 except Exception as sc_err:
                                     print(f"ScrapeCreators fallback failed: {sc_err}")
                                     info = None
@@ -1616,6 +1651,8 @@ def extract_video(
                             ):
                                 try:
                                     info = extract_instagram_scrapecreators(url_decoded)
+                                except HTTPException:
+                                    raise
                                 except Exception as sc_err:
                                     raise HTTPException(
                                         status_code=400,
