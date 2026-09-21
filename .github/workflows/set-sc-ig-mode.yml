@@ -1,0 +1,65 @@
+name: Set SCRAPECREATORS_IG_MODE
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "primary | fallback | off"
+        required: true
+        default: "fallback"
+        type: choice
+        options:
+          - primary
+          - fallback
+          - off
+
+permissions:
+  contents: read
+
+jobs:
+  set-mode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set env + restart service
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RENDER_API_KEY:-}" ] || [ -z "${RENDER_WEB_SERVICE_ID:-}" ]; then
+            echo "Missing RENDER_API_KEY or RENDER_WEB_SERVICE_ID"
+            exit 1
+          fi
+          AUTH="Authorization: Bearer ${RENDER_API_KEY}"
+          BASE="https://api.render.com/v1/services/${RENDER_WEB_SERVICE_ID}"
+
+          echo "PUT SCRAPECREATORS_IG_MODE=${MODE}"
+          curl -fsS -X PUT "${BASE}/env-vars/SCRAPECREATORS_IG_MODE" \
+            -H "${AUTH}" \
+            -H "Accept: application/json" \
+            -H "Content-Type: application/json" \
+            -d "{\"value\":\"${MODE}\"}"
+
+          echo
+          echo "Restart service so process picks up env"
+          curl -fsS -X POST "${BASE}/restart" \
+            -H "${AUTH}" \
+            -H "Accept: application/json"
+
+          echo
+          echo "Verify env var"
+          for i in 1 2 3 4 5; do
+            sleep 3
+            VALUE=$(curl -fsS "${BASE}/env-vars/SCRAPECREATORS_IG_MODE" \
+              -H "${AUTH}" \
+              -H "Accept: application/json" | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("value") or (d.get("envVar") or {}).get("value") or ""))')
+            echo "attempt ${i}: SCRAPECREATORS_IG_MODE=${VALUE}"
+            if [ "${VALUE}" = "${MODE}" ]; then
+              echo "OK"
+              exit 0
+            fi
+          done
+          echo "Env var did not match expected mode"
+          exit 1
