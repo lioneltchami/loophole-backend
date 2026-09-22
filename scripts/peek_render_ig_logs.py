@@ -41,11 +41,11 @@ print("window_start", start)
 
 queries = {
     "scrapecreators_ok": "scrapecreators] ok",
+    "ig_recover_embed": "[ig-recover] embed ok",
+    "ig_recover_sc": "[ig-recover] scrapecreators ok",
+    "free_embed_before_sc": "trying free embed before ScrapeCreators",
     "trying_sc": "Trying ScrapeCreators",
-    "sc_primary_failed": "ScrapeCreators primary failed",
     "primary_video_failed": "Primary video extraction failed",
-    "fallback_video_failed": "Fallback video extraction also failed",
-    "embed": "last-resort curl_cffi",
     "ig_error": "ERROR: [Instagram]",
 }
 
