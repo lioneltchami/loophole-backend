@@ -5,7 +5,7 @@ on:
     inputs:
       lines:
         description: "tail lines"
-        default: "80"
+        default: "120"
         type: string
 
 permissions:
@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Tail Render logs
+      - name: Peek env mode + recent app logs
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
           RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
@@ -25,45 +25,42 @@ jobs:
           set -euo pipefail
           AUTH="Authorization: Bearer ${RENDER_API_KEY}"
           SID="${RENDER_WEB_SERVICE_ID}"
-          # List recent logs (Render logs API)
-          # https://api.render.com/v1/logs?ownerId=&resource=...
-          # Prefer: GET /v1/services/{id}/logs
-          echo "=== service ==="
-          curl -fsS -H "${AUTH}" -H "Accept: application/json" \
-            "https://api.render.com/v1/services/${SID}" | python3 -c 'import sys,json; d=json.load(sys.stdin); s=d.get("service") or d; print(s.get("name"), s.get("id"), s.get("updatedAt")); print("env SCRAPE?", [e for e in []] )'
-          echo "=== env SCRAPECREATORS_IG_MODE ==="
-          curl -fsS -H "${AUTH}" -H "Accept: application/json" \
-            "https://api.render.com/v1/services/${SID}/env-vars/SCRAPECREATORS_IG_MODE"
+          echo "=== SCRAPECREATORS_IG_MODE ==="
+          curl -fsS -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/services/${SID}/env-vars/SCRAPECREATORS_IG_MODE"
           echo
+          echo "=== service ownerId ==="
+          OWNER=$(curl -fsS -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/services/${SID}" | python3 -c 'import sys,json; d=json.load(sys.stdin); s=d.get("service") or d; print(s.get("ownerId") or s.get("owner",{}).get("id") or "")')
+          echo "OWNER=$OWNER"
           echo "=== recent deploys ==="
-          curl -fsS -H "${AUTH}" -H "Accept: application/json" \
-            "https://api.render.com/v1/services/${SID}/deploys?limit=3" | python3 -c 'import sys,json; d=json.load(sys.stdin);
+          curl -fsS -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/services/${SID}/deploys?limit=3" | python3 -c 'import sys,json; d=json.load(sys.stdin);
 for x in d[:3]:
   dep=x.get("deploy") or x
-  print(dep.get("id"), dep.get("status"), dep.get("finishedAt") or dep.get("createdAt"), (dep.get("commit") or {}).get("message","")[:60])'
-          echo "=== logs stream attempt ==="
-          # Render public API: GET https://api.render.com/v1/logs?resource=srv-...&limit=100
-          curl -sS -G -H "${AUTH}" -H "Accept: application/json" \
-            "https://api.render.com/v1/logs" \
-            --data-urlencode "resource=${SID}" \
-            --data-urlencode "limit=${LINES}" \
-            --data-urlencode "type=app" | python3 - <<'P'
-import sys,json
+  print(dep.get("status"), dep.get("finishedAt") or dep.get("createdAt"), ((dep.get("commit") or {}).get("message") or "")[:80])'
+          echo "=== app logs (last ${LINES}) ==="
+          # Render logs need ownerId + resource
+          RESP=$(curl -sS -G -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/logs"             --data-urlencode "ownerId=${OWNER}"             --data-urlencode "resource=${SID}"             --data-urlencode "limit=${LINES}"             --data-urlencode "type=app")
+          python3 -c '
+import json,os,sys
 raw=sys.stdin.read()
 try:
   d=json.loads(raw)
 except Exception:
-  print(raw[:2000]); raise SystemExit
-if isinstance(d, dict) and d.get("error"):
-  print(json.dumps(d)[:1000]); raise SystemExit
-# list of log entries or {logs:[]}
-logs=d if isinstance(d,list) else d.get("logs") or d.get("entries") or []
-print("n=", len(logs), "type=", type(d).__name__)
-for e in logs[-int(__import__("os").environ.get("LINES","80")):]:
+  print(raw[:3000]); raise SystemExit(1)
+if isinstance(d, dict) and ("error" in d or "message" in d) and "logs" not in d and not isinstance(d.get("events"), list):
+  # might still be list-wrapper
+  print(json.dumps(d)[:2000])
+logs=[]
+if isinstance(d, list):
+  logs=d
+elif isinstance(d, dict):
+  logs=d.get("logs") or d.get("entries") or d.get("events") or []
+print("n_logs", len(logs))
+# print all; caller filters
+for e in logs:
   if isinstance(e, dict):
     ts=e.get("timestamp") or e.get("time") or ""
-    msg=e.get("message") or e.get("msg") or e.get("log") or json.dumps(e)[:300]
-    print(f"{ts} {msg}"[:400])
+    msg=e.get("message") or e.get("msg") or e.get("log") or json.dumps(e)[:500]
+    print(f"{ts} {msg}"[:500])
   else:
-    print(str(e)[:400])
-P
+    print(str(e)[:500])
+' <<<"$RESP"
