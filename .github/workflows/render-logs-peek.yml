@@ -1,12 +1,7 @@
-name: Render logs peek
+name: render-logs-peek
 
 on:
   workflow_dispatch:
-    inputs:
-      lines:
-        description: "tail lines"
-        default: "120"
-        type: string
 
 permissions:
   contents: read
@@ -14,53 +9,54 @@ permissions:
 jobs:
   logs:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
     steps:
-      - name: Peek env mode + recent app logs
+      - name: Peek
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
           RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
-          LINES: ${{ inputs.lines }}
         run: |
           set -euo pipefail
-          AUTH="Authorization: Bearer ${RENDER_API_KEY}"
-          SID="${RENDER_WEB_SERVICE_ID}"
-          echo "=== SCRAPECREATORS_IG_MODE ==="
-          curl -fsS -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/services/${SID}/env-vars/SCRAPECREATORS_IG_MODE"
+          A="Authorization: Bearer ${RENDER_API_KEY}"
+          S="${RENDER_WEB_SERVICE_ID}"
+          echo "=== MODE ==="
+          curl -fsS -H "$A" "https://api.render.com/v1/services/${S}/env-vars/SCRAPECREATORS_IG_MODE"
           echo
-          echo "=== service ownerId ==="
-          OWNER=$(curl -fsS -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/services/${SID}" | python3 -c 'import sys,json; d=json.load(sys.stdin); s=d.get("service") or d; print(s.get("ownerId") or s.get("owner",{}).get("id") or "")')
-          echo "OWNER=$OWNER"
-          echo "=== recent deploys ==="
-          curl -fsS -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/services/${SID}/deploys?limit=3" | python3 -c 'import sys,json; d=json.load(sys.stdin);
-for x in d[:3]:
-  dep=x.get("deploy") or x
-  print(dep.get("status"), dep.get("finishedAt") or dep.get("createdAt"), ((dep.get("commit") or {}).get("message") or "")[:80])'
-          echo "=== app logs (last ${LINES}) ==="
-          # Render logs need ownerId + resource
-          RESP=$(curl -sS -G -H "$AUTH" -H "Accept: application/json"             "https://api.render.com/v1/logs"             --data-urlencode "ownerId=${OWNER}"             --data-urlencode "resource=${SID}"             --data-urlencode "limit=${LINES}"             --data-urlencode "type=app")
-          python3 -c '
-import json,os,sys
-raw=sys.stdin.read()
-try:
-  d=json.loads(raw)
-except Exception:
-  print(raw[:3000]); raise SystemExit(1)
-if isinstance(d, dict) and ("error" in d or "message" in d) and "logs" not in d and not isinstance(d.get("events"), list):
-  # might still be list-wrapper
-  print(json.dumps(d)[:2000])
-logs=[]
-if isinstance(d, list):
-  logs=d
-elif isinstance(d, dict):
-  logs=d.get("logs") or d.get("entries") or d.get("events") or []
-print("n_logs", len(logs))
-# print all; caller filters
+          echo "=== SERVICE ==="
+          curl -fsS -H "$A" "https://api.render.com/v1/services/${S}" > /tmp/svc.json
+          python3 -c "import json;d=json.load(open('/tmp/svc.json'));s=d.get('service') or d;print('name',s.get('name'));print('ownerId',s.get('ownerId'));print('updated',s.get('updatedAt'));open('/tmp/owner','w').write(s.get('ownerId') or '')"
+          OWNER=$(cat /tmp/owner)
+          echo "=== DEPLOYS ==="
+          curl -fsS -H "$A" "https://api.render.com/v1/services/${S}/deploys?limit=5" > /tmp/deploys.json
+          python3 -c "import json;d=json.load(open('/tmp/deploys.json'));
+[print((x.get('deploy') or x).get('status'), (x.get('deploy') or x).get('finishedAt') or (x.get('deploy') or x).get('createdAt'), (((x.get('deploy') or x).get('commit') or {}).get('message') or '')[:70]) for x in d[:5]]"
+          echo "=== LOGS ==="
+          # last ~6 hours
+          START=$(date -u -d '12 hours ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-12H +%Y-%m-%dT%H:%M:%SZ)
+          curl -sS -G -H "$A" "https://api.render.com/v1/logs" \
+            --data-urlencode "ownerId=${OWNER}" \
+            --data-urlencode "resource=${S}" \
+            --data-urlencode "limit=100" \
+            --data-urlencode "startTime=${START}" > /tmp/logs.json
+          python3 <<'P'
+import json,re
+raw=open("/tmp/logs.json").read()
+print("raw_head", raw[:300])
+d=json.loads(raw)
+logs=d if isinstance(d,list) else (d.get("logs") or d.get("entries") or d.get("events") or [])
+print("n_logs", len(logs), "top_keys", list(d)[:10] if isinstance(d,dict) else "list")
+pat=re.compile(r"scrapecreators|ScrapeCreators|SCRAPE|Primary video|Fallback video|Instagram blocked|yt-dlp|extractor|_extractor|fallback|MODE", re.I)
+shown=0
 for e in logs:
-  if isinstance(e, dict):
-    ts=e.get("timestamp") or e.get("time") or ""
-    msg=e.get("message") or e.get("msg") or e.get("log") or json.dumps(e)[:500]
-    print(f"{ts} {msg}"[:500])
-  else:
-    print(str(e)[:500])
-' <<<"$RESP"
+  msg=e.get("message") if isinstance(e,dict) else str(e)
+  ts=(e.get("timestamp") if isinstance(e,dict) else "") or ""
+  if pat.search(msg or ""):
+    print(f"{ts} {(msg or '')[:420]}")
+    shown+=1
+print("matched", shown)
+# also print last 30 raw lines for context
+print("--- LAST 30 ---")
+for e in logs[-30:]:
+  msg=e.get("message") if isinstance(e,dict) else str(e)
+  ts=(e.get("timestamp") if isinstance(e,dict) else "") or ""
+  print(f"{ts} {(msg or '')[:300]}")
+P
