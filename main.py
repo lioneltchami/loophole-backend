@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException, Header, Request
+from play_pro import PRO_TOKEN_HEADER, request_has_verified_pro
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import subprocess
@@ -907,8 +908,11 @@ def _try_ig_embed_extract(url: str):
         return None
 
 
-def _try_ig_scrape_creators(url: str):
-    """Paid ScrapeCreators path. Returns info or None (HTTPException propagates)."""
+def _try_ig_scrape_creators(url: str, *, allow_paid: bool):
+    """Paid ScrapeCreators path. Hard-gated: allow_paid must be True (verified Pro)."""
+    if not allow_paid:
+        print("[scrapecreators] skipped — verified Play Pro required")
+        return None
     if not _scrapecreators_configured() or _scrapecreators_ig_mode() == "off":
         return None
     try:
@@ -920,21 +924,31 @@ def _try_ig_scrape_creators(url: str):
         return None
 
 
-def _recover_instagram_after_ytdlp_fail(url: str, err_msg: str):
+def _recover_instagram_after_ytdlp_fail(url: str, err_msg: str, *, allow_paid: bool):
     """
     Free embed BEFORE paid ScrapeCreators.
-    Cookie-death / empty-JSON should not burn SC credits first.
+    SC only when allow_paid (verified Play Pro or trusted ops smoke).
     """
     print(
         "IG yt-dlp failed — trying free embed before ScrapeCreators "
-        f"(signal={ (err_msg or '')[:120].replace(chr(10), ' ') })"
+        f"(signal={ (err_msg or '')[:120].replace(chr(10), ' ') } "
+        f"allow_paid={allow_paid})"
     )
     info = _try_ig_embed_extract(url)
     if info:
         print(f"[ig-recover] embed ok extractor={info.get('_extractor')}")
         return info
+    if not allow_paid:
+        print("[ig-recover] embed miss — SC blocked (not Pro)")
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                "This post needs LoopHole Pro to download. "
+                "Most public posts still work free — upgrade for hard-to-fetch ones."
+            ),
+        )
     print("[ig-recover] embed miss — trying ScrapeCreators (paid)...")
-    info = _try_ig_scrape_creators(url)
+    info = _try_ig_scrape_creators(url, allow_paid=True)
     if info:
         print("[ig-recover] scrapecreators ok")
         return info
@@ -1427,6 +1441,8 @@ def extract_video(
 
     smoke_token = _OPS_SMOKE_REQUEST.set(ops_smoke)
     from_error_cache = False
+    # Paid SC gate: ops smoke OR verified Play purchase token (not rewarded temp Pro).
+    allow_paid_extract = bool(ops_smoke) or request_has_verified_pro(request)
     try:
         url_decoded = urllib.parse.unquote(url)
         url_lower = url_decoded.lower()
@@ -1547,6 +1563,7 @@ def extract_video(
 
         if (
             is_instagram
+            and allow_paid_extract
             and _scrapecreators_configured()
             and _scrapecreators_ig_mode() == "primary"
         ):
@@ -1556,6 +1573,12 @@ def extract_video(
                 raise
             except Exception as sc_primary_err:
                 print(f"ScrapeCreators primary failed: {sc_primary_err}. Trying yt-dlp...")
+        elif (
+            is_instagram
+            and not allow_paid_extract
+            and _scrapecreators_ig_mode() == "primary"
+        ):
+            print("[scrapecreators] primary mode skipped — verified Play Pro required")
         
         # --- Facebook Share Link Unwrapper ---
         # Automatically resolve short share links (e.g. /share/v/) to their true /reel/ or /watch/ URLs
@@ -1666,7 +1689,7 @@ def extract_video(
                 if "empty media response" in primary_msg.lower() and is_instagram:
                     if _is_downloadable_ig_url(url_decoded):
                         record_ig_extract_failure(url_decoded, primary_msg)
-                    info = _recover_instagram_after_ytdlp_fail(url_decoded, primary_msg)
+                    info = _recover_instagram_after_ytdlp_fail(url_decoded, primary_msg, allow_paid=allow_paid_extract)
                     if not info:
                         raise HTTPException(
                             status_code=400,
@@ -1679,7 +1702,7 @@ def extract_video(
                 if is_instagram and _is_ig_cookie_death_signal(primary_msg):
                     if _is_downloadable_ig_url(url_decoded):
                         record_ig_extract_failure(url_decoded, primary_msg)
-                    info = _recover_instagram_after_ytdlp_fail(url_decoded, primary_msg)
+                    info = _recover_instagram_after_ytdlp_fail(url_decoded, primary_msg, allow_paid=allow_paid_extract)
                     if not info:
                         raise HTTPException(
                             status_code=400,
@@ -1716,7 +1739,7 @@ def extract_video(
                         ):
                             if _is_downloadable_ig_url(url_decoded):
                                 record_ig_extract_failure(url_decoded, fallback_msg)
-                            info = _recover_instagram_after_ytdlp_fail(url_decoded, fallback_msg)
+                            info = _recover_instagram_after_ytdlp_fail(url_decoded, fallback_msg, allow_paid=allow_paid_extract)
                             if not info:
                                 raise HTTPException(
                                     status_code=400,
@@ -1752,7 +1775,9 @@ def extract_video(
                         except Exception as fallback_gen_error:
                             if is_instagram:
                                 info = _recover_instagram_after_ytdlp_fail(
-                                    url_decoded, str(fallback_gen_error)
+                                    url_decoded,
+                                    str(fallback_gen_error),
+                                    allow_paid=allow_paid_extract,
                                 )
                                 if not info:
                                     raise HTTPException(
@@ -1876,8 +1901,13 @@ def extract_video(
         return response_data
         
     except HTTPException as he:
-        # Cache every error response to block proxy-burning retries for 3 minutes
-        if not ops_smoke and not from_error_cache:
+        # Cache extract failures to block proxy-burning retries.
+        # Do NOT cache 402 (Pro upgrade) — user may subscribe and retry immediately.
+        if (
+            not ops_smoke
+            and not from_error_cache
+            and he.status_code != 402
+        ):
             try:
                 _error_cache_store(
                     _cache_key,
@@ -1993,6 +2023,13 @@ def _self_check() -> None:
         "extractor": "embed-nocookie",
     })
     assert coerced["_extractor"] == "embed-nocookie" and coerced["url"].endswith(".mp4")
+
+    from play_pro import _subscription_active, _cache_put, _cache_get
+
+    assert _subscription_active({"subscriptionState": "SUBSCRIPTION_STATE_ACTIVE"})
+    assert not _subscription_active({"subscriptionState": "SUBSCRIPTION_STATE_EXPIRED"})
+    _cache_put("tok-test")
+    assert _cache_get("tok-test")
 
     before = len(_ig_failure_urls)
     token = _OPS_SMOKE_REQUEST.set(True)

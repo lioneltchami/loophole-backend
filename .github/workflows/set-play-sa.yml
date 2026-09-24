@@ -1,0 +1,71 @@
+name: Set Google Play SA on Render
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  set-sa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: PUT GOOGLE_PLAY_SERVICE_ACCOUNT_JSON + restart
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_WEB_SERVICE_ID: ${{ secrets.RENDER_WEB_SERVICE_ID }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GOOGLE_PLAY_SERVICE_ACCOUNT_JSON}" ]; then
+            echo "Missing GOOGLE_PLAY_SERVICE_ACCOUNT_JSON secret"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          raw = os.environ["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"]
+          json.loads(raw)  # validate
+          api_key = os.environ["RENDER_API_KEY"]
+          sid = os.environ["RENDER_WEB_SERVICE_ID"]
+          base = f"https://api.render.com/v1/services/{sid}"
+          headers = {
+              "Authorization": f"Bearer {api_key}",
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+          }
+          req = urllib.request.Request(
+              f"{base}/env-vars/GOOGLE_PLAY_SERVICE_ACCOUNT_JSON",
+              data=json.dumps({"value": raw}).encode(),
+              headers=headers,
+              method="PUT",
+          )
+          with urllib.request.urlopen(req, timeout=60) as resp:
+              print("PUT status", resp.status)
+          req2 = urllib.request.Request(
+              f"{base}/restart",
+              data=b"",
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Accept": "application/json",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(req2, timeout=60) as resp:
+              print("restart status", resp.status)
+          req3 = urllib.request.Request(
+              f"{base}/env-vars/GOOGLE_PLAY_SERVICE_ACCOUNT_JSON",
+              headers={
+                  "Authorization": f"Bearer {api_key}",
+                  "Accept": "application/json",
+              },
+          )
+          with urllib.request.urlopen(req3, timeout=60) as resp:
+              data = json.load(resp)
+          val = data.get("value") or (data.get("envVar") or {}).get("value") or ""
+          assert val and "service_account" in val, "unexpected SA payload shape"
+          print("OK: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON set (len=%d)" % len(val))
+          PY
