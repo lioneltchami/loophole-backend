@@ -36,13 +36,15 @@ owner = s.get("ownerId") or ""
 print("service", s.get("name"), "owner", owner)
 
 # Flip was 2026-09-21T18:25Z
-start = "2026-09-21T18:25:00Z"
+start = "2026-09-24T20:00:00Z"
 print("window_start", start)
 
 queries = {
     "scrapecreators_ok": "scrapecreators] ok",
     "ig_recover_embed": "[ig-recover] embed ok",
     "ig_recover_sc": "[ig-recover] scrapecreators ok",
+    "sc_blocked": "SC blocked",
+    "play_pro": "[play-pro]",
     "free_embed_before_sc": "trying free embed before ScrapeCreators",
     "trying_sc": "Trying ScrapeCreators",
     "primary_video_failed": "Primary video extraction failed",
