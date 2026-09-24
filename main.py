@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query, HTTPException, Header, Request
-from play_pro import PRO_TOKEN_HEADER, request_has_verified_pro
+from play_pro import request_has_verified_pro
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import subprocess
@@ -1441,9 +1441,12 @@ def extract_video(
 
     smoke_token = _OPS_SMOKE_REQUEST.set(ops_smoke)
     from_error_cache = False
-    # Paid SC gate: ops smoke OR verified Play purchase token (not rewarded temp Pro).
-    allow_paid_extract = bool(ops_smoke) or request_has_verified_pro(request)
+    allow_paid_extract = bool(ops_smoke)
     try:
+        # Paid SC gate: ops smoke OR verified Play purchase token (not rewarded temp Pro).
+        # Inside try so Play-auth failures cannot escape as unhandled 500s.
+        if not allow_paid_extract:
+            allow_paid_extract = request_has_verified_pro(request)
         url_decoded = urllib.parse.unquote(url)
         url_lower = url_decoded.lower()
 
@@ -2024,12 +2027,36 @@ def _self_check() -> None:
     })
     assert coerced["_extractor"] == "embed-nocookie" and coerced["url"].endswith(".mp4")
 
-    from play_pro import _subscription_active, _cache_put, _cache_get
+    from play_pro import (
+        _subscription_active,
+        _cache_put,
+        _cache_get,
+        verify_play_purchase_token,
+    )
 
     assert _subscription_active({"subscriptionState": "SUBSCRIPTION_STATE_ACTIVE"})
     assert not _subscription_active({"subscriptionState": "SUBSCRIPTION_STATE_EXPIRED"})
+    assert _subscription_active({
+        "subscriptionState": "SUBSCRIPTION_STATE_ACTIVE",
+        "lineItems": [{"productId": "loophole_pro_monthly"}],
+    })
+    assert not _subscription_active({
+        "subscriptionState": "SUBSCRIPTION_STATE_ACTIVE",
+        "lineItems": [{"productId": "other_sku"}],
+    })
     _cache_put("tok-test")
     assert _cache_get("tok-test")
+    # Malformed SA must fail closed (never raise)
+    import os as _os
+    _prev = _os.environ.get("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
+    _os.environ["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] = '{"type":"service_account"}'
+    try:
+        assert verify_play_purchase_token("definitely-not-a-real-token-xxxxxx") is False
+    finally:
+        if _prev is None:
+            _os.environ.pop("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON", None)
+        else:
+            _os.environ["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] = _prev
 
     before = len(_ig_failure_urls)
     token = _OPS_SMOKE_REQUEST.set(True)
